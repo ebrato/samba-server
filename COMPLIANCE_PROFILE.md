@@ -1,7 +1,7 @@
 # Compliance Profile (MISRA + DbC + ISO-Oriented Baseline)
 
 ## Scope
-- Applies to `smb.cpp`, `build.zig`, `quality_gate.sh`, `qca.sh`, and deploy examples in `deploy/`.
+- Applies to `smb.cpp`, `build.zig`, `quality_gate.sh`, and `interop_smbclient.sh`.
 - Goal is a hardened engineering baseline for portable SMB2/SMB3 negotiation services.
 
 ## Design by Contract (DbC)
@@ -33,21 +33,12 @@
 - Per-IP concurrent connection limits are enforced before request processing.
 - Signed authenticated sessions apply replay protection (`message_id` duplicate rejection).
 - Server challenge and GUID generation use OS CSPRNG sources.
-- CSPRNG failures are handled in fail-secure mode (auth denied / connection closed or startup aborted).
 - File-serving operations implemented with state validation: `TREE_CONNECT`, `CREATE`, `WRITE`, `READ`, `CLOSE`.
 - Share path handling is constrained to `--share-dir` with path normalization and traversal rejection.
 - Dotfiles are denied by default and overwrite dispositions are opt-in to reduce risky write paths.
 - Per-connection/file limits (`max-open-files`, `max-file-size`) are enforced to reduce resource exhaustion risk.
 - Socket receive/send timeouts and keepalive are enabled to mitigate resource exhaustion.
 - Concurrent client limit is enforced (`kMaxConcurrentClients`).
-
-## Verification Baseline
-- `quality_gate.sh` validates strict build, self-test and sanitizer execution.
-- `qca.sh` validates negative config checks and runtime security scenarios:
-  - signing required vs unsigned client;
-  - brute-force temporary blocking by IP;
-  - per-IP concurrent connection limit.
-- Runtime/interop checks are environment-dependent and can be marked required via `QCA_REQUIRE_RUNTIME=1`.
 
 ## ISO / Defense-Oriented Mapping (engineering baseline)
 - `ISO/IEC 14882` (C++ language conformance): modern C++17 subset and strict diagnostics.
@@ -61,4 +52,3 @@
   - Independent static analysis tool qualification and reports.
   - Full threat modeling, secure SDLC evidence, and traceability matrices.
   - Third-party audit/certification process with documented test coverage.
-- Security posture still depends on operational controls outside this repository (network segmentation, firewall allowlist, hardened host, centralized logging).
