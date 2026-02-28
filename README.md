@@ -28,6 +28,7 @@ Este projeto prioriza:
 - Assinatura SMB2 (`SMB signing`) opcional por sessão autenticada
 - Antirreplay por sessão assinada (rejeita `message_id` duplicado)
 - Rejeição de requests compostas SMB2 (`next_command != 0`)
+- Entropia forte via CSPRNG do SO para challenge NTLM e GUID do servidor (fail-secure em erro)
 - Hardening de share (`read-only`, limite de handles, limite de tamanho de arquivo)
 - Bloqueio de traversal/symlink-escape e dotfiles por padrão
 - Controles anti brute-force e DoS por IP (janela de falhas, bloqueio temporário e limite de conexões por IP)
@@ -153,6 +154,7 @@ Artefatos gerados em `release/bin`:
   - força autenticação
   - exige `--share-dir` explícito
   - aplica limites mais rígidos (incluindo anti-abuse por IP)
+  - defaults: `max_clients_per_ip=4`, `auth_fail_window_sec=900`, `auth_fail_max=3`, `auth_block_sec=3600`
 - `--disable-legacy-ntlm`
   - flag de compatibilidade; NTLM legado já é sempre rejeitado
 - `--enable-signing`
@@ -203,6 +205,8 @@ QCA completo (recomendado para pré-release):
 - cenários negativos de segurança para brute force (bloqueio temporário por IP) e limite de conexões por IP
 - interop com `smbclient` quando disponível
 - relatório em `dist/qca/qca_report.txt`
+
+Observação: perfis de hardening máximo podem reduzir compatibilidade com clientes legados em interop SMB.
 
 Variáveis úteis do QCA:
 
@@ -267,3 +271,12 @@ Workflow: `.github/workflows/release.yml`
 Este projeto cobre o baseline SMB2/SMB3 descrito acima, com autenticação NTLMv2 e opção de assinatura SMB2.
 
 Para ambiente corporativo com requisitos avançados (por exemplo, Kerberos nativo, SMB3 encryption fim a fim e recursos completos de durable handles/leasing), execute validação de aderência de protocolo antes de adoção em produção crítica.
+
+## Limite de segurança
+
+Não existe servidor "100% à prova de hackers". Este projeto adota defesa em profundidade no binário e no deploy, mas produção deve combinar também:
+
+- segmentação de rede;
+- firewall com allowlist;
+- monitoração e resposta a incidentes;
+- atualização contínua de sistema e dependências.
