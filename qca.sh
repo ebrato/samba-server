@@ -172,212 +172,6 @@ run_runtime_case() {
   return 1
 }
 
-run_runtime_bruteforce_block_case() {
-  local name="$1"
-
-  if [[ "${RUNTIME_BLOCKED}" -eq 1 ]]; then
-    mark_skip "${name} (runtime bloqueado no ambiente atual)"
-    return 0
-  fi
-
-  local port="${NEXT_PORT}"
-  NEXT_PORT=$((NEXT_PORT + 1))
-
-  local server_log="${OUT_DIR}/${name}.server.log"
-  local wrong1_log="${OUT_DIR}/${name}.wrong1.log"
-  local wrong2_log="${OUT_DIR}/${name}.wrong2.log"
-  local blocked_log="${OUT_DIR}/${name}.blocked.log"
-  local after_log="${OUT_DIR}/${name}.after.log"
-
-  log "[step] runtime:${name} (port=${port})"
-
-  set +e
-  "${ROOT_DIR}/dist/quality/smb_cli_strict" serve \
-    --share-dir "${ROOT_DIR}" \
-    --port "${port}" \
-    --username "${QCA_USER}" \
-    --password "${QCA_PASS}" \
-    --auth-fail-window-sec 60 \
-    --auth-fail-max 2 \
-    --auth-block-sec 2 \
-    >"${server_log}" 2>&1 &
-  local server_pid=$!
-  sleep 0.8
-
-  if ! kill -0 "${server_pid}" >/dev/null 2>&1; then
-    wait "${server_pid}" >/dev/null 2>&1 || true
-    set -e
-    if grep -q "failed to bind/listen" "${server_log}"; then
-      RUNTIME_BLOCKED=1
-      if [[ "${QCA_REQUIRE_RUNTIME}" == "1" ]]; then
-        mark_fail "runtime:${name} (ambiente sem bind de socket)"
-        sed -n '1,80p' "${server_log}" >>"${REPORT_FILE}" || true
-        return 1
-      fi
-      mark_skip "runtime:${name} (ambiente sem bind de socket)"
-      sed -n '1,40p' "${server_log}" >>"${REPORT_FILE}" || true
-      return 0
-    fi
-    mark_fail "runtime:${name} (servidor finalizou prematuramente)"
-    sed -n '1,120p' "${server_log}" >>"${REPORT_FILE}" || true
-    return 1
-  fi
-
-  "${ROOT_DIR}/dist/quality/smb_cli_strict" smoke-client \
-    --host 127.0.0.1 \
-    --port "${port}" \
-    --username "${QCA_USER}" \
-    --password "${QCA_PASS}-bad1" >"${wrong1_log}" 2>&1
-  local wrong1_rc=$?
-
-  "${ROOT_DIR}/dist/quality/smb_cli_strict" smoke-client \
-    --host 127.0.0.1 \
-    --port "${port}" \
-    --username "${QCA_USER}" \
-    --password "${QCA_PASS}-bad2" >"${wrong2_log}" 2>&1
-  local wrong2_rc=$?
-
-  "${ROOT_DIR}/dist/quality/smb_cli_strict" smoke-client \
-    --host 127.0.0.1 \
-    --port "${port}" \
-    --username "${QCA_USER}" \
-    --password "${QCA_PASS}" >"${blocked_log}" 2>&1
-  local blocked_rc=$?
-
-  sleep 3
-
-  "${ROOT_DIR}/dist/quality/smb_cli_strict" smoke-client \
-    --host 127.0.0.1 \
-    --port "${port}" \
-    --username "${QCA_USER}" \
-    --password "${QCA_PASS}" >"${after_log}" 2>&1
-  local after_rc=$?
-
-  if kill -0 "${server_pid}" >/dev/null 2>&1; then
-    kill "${server_pid}" >/dev/null 2>&1 || true
-  fi
-  wait "${server_pid}" >/dev/null 2>&1 || true
-  set -e
-
-  if [[ "${wrong1_rc}" -eq 0 ]] || [[ "${wrong2_rc}" -eq 0 ]]; then
-    mark_fail "runtime:${name} (falhas de credencial inválida deveriam falhar)"
-    sed -n '1,120p' "${wrong1_log}" >>"${REPORT_FILE}" || true
-    sed -n '1,120p' "${wrong2_log}" >>"${REPORT_FILE}" || true
-    return 1
-  fi
-
-  if [[ "${blocked_rc}" -eq 0 ]]; then
-    mark_fail "runtime:${name} (IP não foi bloqueado após brute force)"
-    sed -n '1,120p' "${blocked_log}" >>"${REPORT_FILE}" || true
-    sed -n '1,120p' "${server_log}" >>"${REPORT_FILE}" || true
-    return 1
-  fi
-
-  if [[ "${after_rc}" -ne 0 ]]; then
-    mark_fail "runtime:${name} (autenticação não voltou após expiração do bloqueio)"
-    sed -n '1,120p' "${after_log}" >>"${REPORT_FILE}" || true
-    sed -n '1,120p' "${server_log}" >>"${REPORT_FILE}" || true
-    return 1
-  fi
-
-  if ! grep -q "IP temporarily blocked" "${server_log}"; then
-    mark_fail "runtime:${name} (servidor não registrou bloqueio de IP)"
-    sed -n '1,160p' "${server_log}" >>"${REPORT_FILE}" || true
-    return 1
-  fi
-
-  mark_pass "runtime:${name}"
-  return 0
-}
-
-run_runtime_per_ip_limit_case() {
-  local name="$1"
-
-  if [[ "${RUNTIME_BLOCKED}" -eq 1 ]]; then
-    mark_skip "${name} (runtime bloqueado no ambiente atual)"
-    return 0
-  fi
-
-  local port="${NEXT_PORT}"
-  NEXT_PORT=$((NEXT_PORT + 1))
-
-  local server_log="${OUT_DIR}/${name}.server.log"
-  local hold_log="${OUT_DIR}/${name}.hold.log"
-  local client_log="${OUT_DIR}/${name}.client.log"
-
-  log "[step] runtime:${name} (port=${port})"
-
-  set +e
-  "${ROOT_DIR}/dist/quality/smb_cli_strict" serve \
-    --share-dir "${ROOT_DIR}" \
-    --port "${port}" \
-    --allow-anonymous \
-    --max-clients-per-ip 1 \
-    >"${server_log}" 2>&1 &
-  local server_pid=$!
-  sleep 0.8
-
-  if ! kill -0 "${server_pid}" >/dev/null 2>&1; then
-    wait "${server_pid}" >/dev/null 2>&1 || true
-    set -e
-    if grep -q "failed to bind/listen" "${server_log}"; then
-      RUNTIME_BLOCKED=1
-      if [[ "${QCA_REQUIRE_RUNTIME}" == "1" ]]; then
-        mark_fail "runtime:${name} (ambiente sem bind de socket)"
-        sed -n '1,80p' "${server_log}" >>"${REPORT_FILE}" || true
-        return 1
-      fi
-      mark_skip "runtime:${name} (ambiente sem bind de socket)"
-      sed -n '1,40p' "${server_log}" >>"${REPORT_FILE}" || true
-      return 0
-    fi
-    mark_fail "runtime:${name} (servidor finalizou prematuramente)"
-    sed -n '1,120p' "${server_log}" >>"${REPORT_FILE}" || true
-    return 1
-  fi
-
-  bash -lc "exec 9<>/dev/tcp/127.0.0.1/${port}; sleep 3; exec 9>&-; exec 9<&-" >"${hold_log}" 2>&1 &
-  local hold_pid=$!
-  sleep 0.4
-
-  "${ROOT_DIR}/dist/quality/smb_cli_strict" smoke-client \
-    --host 127.0.0.1 \
-    --port "${port}" \
-    --allow-anonymous >"${client_log}" 2>&1
-  local client_rc=$?
-
-  wait "${hold_pid}" >/dev/null 2>&1
-  local hold_rc=$?
-
-  if kill -0 "${server_pid}" >/dev/null 2>&1; then
-    kill "${server_pid}" >/dev/null 2>&1 || true
-  fi
-  wait "${server_pid}" >/dev/null 2>&1 || true
-  set -e
-
-  if [[ "${hold_rc}" -ne 0 ]]; then
-    mark_skip "runtime:${name} (ambiente não suportou conexão de retenção via /dev/tcp)"
-    sed -n '1,80p' "${hold_log}" >>"${REPORT_FILE}" || true
-    return 0
-  fi
-
-  if [[ "${client_rc}" -eq 0 ]]; then
-    mark_fail "runtime:${name} (esperava rejeição por limite por IP)"
-    sed -n '1,120p' "${client_log}" >>"${REPORT_FILE}" || true
-    sed -n '1,120p' "${server_log}" >>"${REPORT_FILE}" || true
-    return 1
-  fi
-
-  if ! grep -q "per-IP limit reached" "${server_log}"; then
-    mark_fail "runtime:${name} (servidor não registrou rejeição por limite por IP)"
-    sed -n '1,160p' "${server_log}" >>"${REPORT_FILE}" || true
-    return 1
-  fi
-
-  mark_pass "runtime:${name}"
-  return 0
-}
-
 main() {
   log "[qca] start"
   log "[qca] require_runtime=${QCA_REQUIRE_RUNTIME} run_matrix=${QCA_RUN_MATRIX} run_interop=${QCA_RUN_INTEROP}"
@@ -421,14 +215,6 @@ main() {
     "password too short" \
     "${ROOT_DIR}/dist/quality/smb_cli_strict" serve --username "${QCA_USER}" --password short || true
 
-  run_expect_fail "invalid-max-clients-per-ip-zero" \
-    "invalid --max-clients-per-ip value" \
-    "${ROOT_DIR}/dist/quality/smb_cli_strict" serve --max-clients-per-ip 0 || true
-
-  run_expect_fail "invalid-auth-fail-max-zero" \
-    "invalid --auth-fail-max value" \
-    "${ROOT_DIR}/dist/quality/smb_cli_strict" serve --auth-fail-max 0 || true
-
   run_step "readme-no-known-limitations-section" \
     bash -lc "! rg -q '^## Limitações conhecidas' \"${ROOT_DIR}/README.md\"" || true
 
@@ -439,8 +225,8 @@ main() {
   set -e
   if [[ "${help_rc}" -ne 0 ]]; then
     mark_fail "cli-usage-check (help rc=${help_rc})"
-  elif ! grep -Eq -- "--enable-signing|--require-signing|--disable-client-signing|--max-clients-per-ip|--auth-fail-window-sec|--auth-fail-max|--auth-block-sec" "${OUT_DIR}/help.txt"; then
-    mark_fail "cli-usage-check (flags de hardening ausentes no help)"
+  elif ! grep -Eq -- "--enable-signing|--require-signing|--disable-client-signing" "${OUT_DIR}/help.txt"; then
+    mark_fail "cli-usage-check (flags de signing ausentes no help)"
   else
     mark_pass "cli-usage-check"
   fi
@@ -469,9 +255,6 @@ main() {
     "--allow-anonymous" \
     "--allow-anonymous" \
     "0" || true
-
-  run_runtime_bruteforce_block_case "auth_bruteforce_block" || true
-  run_runtime_per_ip_limit_case "per_ip_connection_limit" || true
 
   if [[ "${QCA_RUN_INTEROP}" == "1" ]] || [[ "${QCA_RUN_INTEROP}" == "auto" && -x "${ROOT_DIR}/interop_smbclient.sh" ]]; then
     if [[ "${RUNTIME_BLOCKED}" -eq 1 ]]; then

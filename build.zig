@@ -58,7 +58,6 @@ fn addSmbExe(
 
     if (is_windows) {
         exe.linkSystemLibrary("ws2_32");
-        exe.linkSystemLibrary("bcrypt");
     }
 
     return exe;

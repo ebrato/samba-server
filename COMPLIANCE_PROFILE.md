@@ -26,18 +26,13 @@
 - Protocol parser rejects invalid structure sizes and malformed buffers.
 - Compound requests (`next_command != 0`) are rejected to reduce parser complexity.
 - Unsupported commands return explicit SMB status, then close the connection.
-- `SESSION_SETUP` enforces NTLMv2 and rejects legacy auth paths (NTLMv1/NTLM2-session).
-- `SESSION_SETUP` with plaintext blob (`USER=...;PASS=...`) is rejected.
+- `SESSION_SETUP` now enforces explicit credentials by default (`--username` / `--password`), returning logon failure on mismatch.
 - Runtime rejects weak credentials in auth mode (minimum password length policy).
-- Failed authentication attempts are tracked per IP with temporary blocking windows.
-- Per-IP concurrent connection limits are enforced before request processing.
-- Signed authenticated sessions apply replay protection (`message_id` duplicate rejection).
-- Server challenge and GUID generation use OS CSPRNG sources.
 - File-serving operations implemented with state validation: `TREE_CONNECT`, `CREATE`, `WRITE`, `READ`, `CLOSE`.
 - Share path handling is constrained to `--share-dir` with path normalization and traversal rejection.
 - Dotfiles are denied by default and overwrite dispositions are opt-in to reduce risky write paths.
 - Per-connection/file limits (`max-open-files`, `max-file-size`) are enforced to reduce resource exhaustion risk.
-- Socket receive/send timeouts and keepalive are enabled to mitigate resource exhaustion.
+- Socket receive/send timeouts are enabled to mitigate resource exhaustion.
 - Concurrent client limit is enforced (`kMaxConcurrentClients`).
 
 ## ISO / Defense-Oriented Mapping (engineering baseline)

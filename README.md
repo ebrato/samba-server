@@ -23,14 +23,10 @@ Este projeto prioriza:
   - `NEGOTIATE`, `SESSION_SETUP`, `LOGOFF`, `TREE_CONNECT`, `TREE_DISCONNECT`
   - `CREATE`, `WRITE`, `READ`, `CLOSE`, `FLUSH`, `LOCK`, `IOCTL`, `CANCEL`, `ECHO`
   - `QUERY_INFO`, `QUERY_DIRECTORY`, `CHANGE_NOTIFY`, `SET_INFO`, `OPLOCK_BREAK`
-- Autenticação NTLMv2-only (NTLMv1/NTLM2-session desabilitados)
-- `SESSION_SETUP` com blob em texto `USER=...;PASS=...` rejeitado por padrão
+- Autenticação NTLM (com opção de bloquear legados)
 - Assinatura SMB2 (`SMB signing`) opcional por sessão autenticada
-- Antirreplay por sessão assinada (rejeita `message_id` duplicado)
-- Rejeição de requests compostas SMB2 (`next_command != 0`)
 - Hardening de share (`read-only`, limite de handles, limite de tamanho de arquivo)
 - Bloqueio de traversal/symlink-escape e dotfiles por padrão
-- Controles anti brute-force e DoS por IP (janela de falhas, bloqueio temporário e limite de conexões por IP)
 - Perfil de produção com defaults mais seguros (`--prod-profile`)
 
 ## Requisitos
@@ -152,25 +148,21 @@ Artefatos gerados em `release/bin`:
 - `--prod-profile`
   - força autenticação
   - exige `--share-dir` explícito
-  - aplica limites mais rígidos (incluindo anti-abuse por IP)
+  - aplica limites mais rígidos
 - `--disable-legacy-ntlm`
-  - flag de compatibilidade; NTLM legado já é sempre rejeitado
+  - aceita apenas NTLMv2
 - `--enable-signing`
   - habilita assinatura SMB2 para sessões autenticadas
 - `--require-signing`
   - exige requests SMB2 assinados após autenticação
 - `--strict-auth-session-flags`
-  - compatibilidade legada (atualmente o padrão já evita flag guest em sessão autenticada)
+  - remove compatibilidade guest nos flags de sessão autenticada
 - `--read-only`
   - bloqueia escrita e disposições destrutivas
 - `--max-open-files <n>`
 - `--max-file-size <bytes>`
 - `--timeout <segundos>`
 - `--max-clients <n>`
-- `--max-clients-per-ip <n>`
-- `--auth-fail-window-sec <n>`
-- `--auth-fail-max <n>`
-- `--auth-block-sec <n>`
 
 ## Qualidade
 
@@ -200,7 +192,6 @@ QCA completo (recomendado para pré-release):
 - `self-test` do binário final
 - validações negativas de configuração (combinações inválidas de auth/signing e credenciais)
 - cenários de runtime para auth/anônimo/signing (incluindo caso negativo com cliente sem assinatura)
-- cenários negativos de segurança para brute force (bloqueio temporário por IP) e limite de conexões por IP
 - interop com `smbclient` quando disponível
 - relatório em `dist/qca/qca_report.txt`
 
@@ -236,19 +227,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now smb-single
 ```
 
-## Hardening de borda (host/rede)
-
-Exemplos prontos para complementar o hardening do binário:
-
-- `deploy/nftables/smb-single.nft.example`
-  - allowlist de CIDRs, controle de taxa e regra base para SMB/TCP
-- `deploy/fail2ban/filter.d/smb-single.conf`
-  - filtro para eventos de falha de autenticação (`[warn] auth failure ip=...`)
-- `deploy/fail2ban/jail.d/smb-single.local.example`
-  - jail de referência com ban temporário
-
-Também foi reforçado o template `deploy/systemd/smb-single.service.example` com sandboxing adicional (`ProtectKernel*`, `MemoryDenyWriteExecute`, `RestrictNamespaces`, `RestrictAddressFamilies`, `SystemCallFilter`).
-
 ## CI/CD (GitHub Actions)
 
 Workflow: `.github/workflows/release.yml`
@@ -264,6 +242,6 @@ Workflow: `.github/workflows/release.yml`
 
 ## Escopo de protocolo
 
-Este projeto cobre o baseline SMB2/SMB3 descrito acima, com autenticação NTLMv2 e opção de assinatura SMB2.
+Este projeto cobre o baseline SMB2/SMB3 descrito acima, com autenticação NTLM e opção de assinatura SMB2.
 
 Para ambiente corporativo com requisitos avançados (por exemplo, Kerberos nativo, SMB3 encryption fim a fim e recursos completos de durable handles/leasing), execute validação de aderência de protocolo antes de adoção em produção crítica.
