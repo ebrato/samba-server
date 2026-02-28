@@ -1,0 +1,29 @@
+# Build outputs / caches
+.zig-cache/
+zig-out/
+release/
+dist/
+
+# Local downloaded toolchains
+zig.tar.xz
+zig-*/
+cosmocc.zip
+cosmocc-*/
+
+# Test/runtime leftovers
+*.log
+*.tmp
+*.swp
+*.swo
+smoke_upload.bin
+
+# Secrets / local env
+.keys/
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

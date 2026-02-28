@@ -1,0 +1,25 @@
+[Unit]
+Description=SMB Singlefile Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=smbsvc
+Group=smbsvc
+WorkingDirectory=/opt/smb-single
+EnvironmentFile=/etc/smb-single/smb-single.env
+ExecStart=/opt/smb-single/dist/bin/smb_cli-linux-x86_64 serve --prod-profile --port ${SMB_PORT} --share-dir ${SMB_SHARE_DIR} --username ${SMB_USERNAME} --password ${SMB_PASSWORD}
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/smb
+LimitNOFILE=8192
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
