@@ -20,22 +20,63 @@ if ! command -v zig >/dev/null 2>&1; then
   exit 1
 fi
 
+COMMON_FLAGS=(
+  -target x86_64-linux-musl
+  -std=c++17
+  -pthread
+  -DSMB_ENABLE_CONTRACTS=1
+  -D_FORTIFY_SOURCE=2
+  -D_GLIBCXX_ASSERTIONS
+  -Wall
+  -Wextra
+  -Wpedantic
+  -Wconversion
+  -Wsign-conversion
+  -Wshadow
+  -Wformat=2
+  -Wformat-security
+  -Wundef
+  -Wnull-dereference
+  -Wcast-qual
+  -Wwrite-strings
+  -Wmissing-declarations
+  -Woverloaded-virtual
+  -Wnon-virtual-dtor
+  -Wimplicit-fallthrough
+  -Werror
+  -Wno-error=option-ignored
+  -fstack-protector-strong
+  -fno-omit-frame-pointer
+)
+
 echo "[build] strict single-file binary"
 ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR}" \
 ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR}" \
 TMPDIR="${ZIG_TMP_DIR}" \
 zig c++ \
-  -target x86_64-linux-musl \
-  -std=c++17 \
   -O2 \
-  -pthread \
-  -DSMB_ENABLE_CONTRACTS=1 \
-  -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror \
+  "${COMMON_FLAGS[@]}" \
   "${ROOT_DIR}/smb.cpp" \
   -o "${OUT_DIR}/smb_cli_strict"
 
-echo "[test] packet self-test"
+echo "[build] sanitizer single-file binary"
+ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR}" \
+ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR}" \
+TMPDIR="${ZIG_TMP_DIR}" \
+zig c++ \
+  -O1 \
+  -g \
+  -fsanitize=address,undefined \
+  -fno-sanitize-recover=all \
+  "${COMMON_FLAGS[@]}" \
+  "${ROOT_DIR}/smb.cpp" \
+  -o "${OUT_DIR}/smb_cli_san"
+
+echo "[test] packet self-test (strict)"
 "${OUT_DIR}/smb_cli_strict" self-test
+
+echo "[test] packet self-test (asan+ubsan)"
+"${OUT_DIR}/smb_cli_san" self-test
 
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]]; then

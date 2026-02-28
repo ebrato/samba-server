@@ -66,6 +66,14 @@ Build do alvo Cosmopolitan (`.com`):
 zig build cosmo -Doptimize=ReleaseFast
 ```
 
+Se o wrapper C++ disponível no ambiente não for `cosmoc++`, sobrescreva o comando:
+
+```bash
+zig build cosmo -Doptimize=ReleaseFast -Dcosmo-cxx=cosmocc
+```
+
+Observação: o build tenta autodetectar `cosmoc++`/`cosmocc++`/`cosmocc` no `PATH` e converte automaticamente `cosmocc` para `cosmoc++`.
+
 Build completo (matriz + cosmo):
 
 ```bash
@@ -97,7 +105,7 @@ Artefatos gerados em `release/bin`:
 - `smb_cli_windows_arm64.exe` (`aarch64-windows-gnu`)
 - `smb_cli_freebsd_x86_64` (`x86_64-freebsd`)
 - `smb_cli_freebsd_arm64` (`aarch64-freebsd`)
-- `smb_cli_x86_64-unknown-cosmo.com` (Cosmopolitan APE, via `cosmoc++`)
+- `smb_cli_x86_64-unknown-cosmo.com` (Cosmopolitan APE, via `cosmoc++` por padrão; configurável por `-Dcosmo-cxx`)
 
 ## Uso
 
@@ -166,8 +174,9 @@ Gate local:
 
 Esse gate executa:
 
-- build estrito com warnings elevados
-- `self-test`
+- build estrito com hardening (`stack-protector`, `FORTIFY`, frame pointers) e warnings tratados como erro
+- `self-test` no binário estrito
+- `self-test` adicional com `ASan+UBSan`
 - smoke test runtime (best effort em ambientes restritos)
 
 QCA completo (recomendado para pré-release):

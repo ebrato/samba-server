@@ -3269,8 +3269,11 @@ std::array<std::uint8_t, 32> sha256_hash(const std::vector<std::uint8_t>& data) 
     while ((msg.size() % 64U) != 56U) {
         msg.push_back(0U);
     }
-    for (int i = 7; i >= 0; --i) {
-        msg.push_back(static_cast<std::uint8_t>((bit_len >> (static_cast<std::uint64_t>(i) * 8ULL)) & 0xFFULL));
+    for (std::uint32_t shift = 56U;; shift -= 8U) {
+        msg.push_back(static_cast<std::uint8_t>((bit_len >> shift) & 0xFFULL));
+        if (shift == 0U) {
+            break;
+        }
     }
 
     for (std::size_t chunk = 0U; chunk < msg.size(); chunk += 64U) {

@@ -80,6 +80,20 @@ pub fn build(b: *std.Build) void {
         "Default triple for `zig build` and `zig build native`",
     ) orelse "x86_64-linux-musl";
     const default_target = resolveQuery(b, default_triple, null);
+    const cosmo_cxx_raw = b.option(
+        []const u8,
+        "cosmo-cxx",
+        "Cosmopolitan C++ compiler command for `zig build cosmo` (default: cosmoc++)",
+    ) orelse b.findProgram(
+        &.{ "cosmoc++", "cosmocc++", "cosmocc" },
+        &.{},
+    ) catch "cosmoc++";
+    const cosmo_cxx = if (std.mem.endsWith(u8, cosmo_cxx_raw, "/cosmocc"))
+        b.fmt("{s}cosmoc++", .{cosmo_cxx_raw[0 .. cosmo_cxx_raw.len - "cosmocc".len]})
+    else if (std.mem.eql(u8, cosmo_cxx_raw, "cosmocc"))
+        "cosmoc++"
+    else
+        cosmo_cxx_raw;
 
     const base_flags_posix: []const []const u8 = &.{
         "-std=c++17",
@@ -91,6 +105,22 @@ pub fn build(b: *std.Build) void {
         "-Wconversion",
         "-Wsign-conversion",
         "-Wshadow",
+        "-Wformat=2",
+        "-Wformat-security",
+        "-Wundef",
+        "-Wnull-dereference",
+        "-Wcast-qual",
+        "-Wwrite-strings",
+        "-Wmissing-declarations",
+        "-Woverloaded-virtual",
+        "-Wnon-virtual-dtor",
+        "-Wimplicit-fallthrough",
+        "-Werror",
+        "-Wno-error=option-ignored",
+        "-fstack-protector-strong",
+        "-fno-omit-frame-pointer",
+        "-D_FORTIFY_SOURCE=2",
+        "-D_GLIBCXX_ASSERTIONS",
     };
 
     const base_flags_windows: []const []const u8 = &.{
@@ -102,6 +132,20 @@ pub fn build(b: *std.Build) void {
         "-Wconversion",
         "-Wsign-conversion",
         "-Wshadow",
+        "-Wformat=2",
+        "-Wformat-security",
+        "-Wundef",
+        "-Wnull-dereference",
+        "-Wcast-qual",
+        "-Wwrite-strings",
+        "-Wmissing-declarations",
+        "-Woverloaded-virtual",
+        "-Wnon-virtual-dtor",
+        "-Wimplicit-fallthrough",
+        "-Werror",
+        "-Wno-error=option-ignored",
+        "-fstack-protector-strong",
+        "-fno-omit-frame-pointer",
     };
 
     // Fast local build (default selected target).
@@ -121,7 +165,7 @@ pub fn build(b: *std.Build) void {
     const cosmo_out = b.getInstallPath(.bin, "smb_cli_x86_64-unknown-cosmo.com");
     const mkdir_release_bin = b.addSystemCommand(&.{ "mkdir", "-p", b.exe_dir });
     const cosmo_cmd = b.addSystemCommand(&.{
-        "cosmoc++",
+        cosmo_cxx,
         "-O2",
         "-std=c++17",
         "-pthread",
@@ -132,6 +176,18 @@ pub fn build(b: *std.Build) void {
         "-Wconversion",
         "-Wsign-conversion",
         "-Wshadow",
+        "-Wformat=2",
+        "-Wformat-security",
+        "-Wundef",
+        "-Wnull-dereference",
+        "-Wcast-qual",
+        "-Wwrite-strings",
+        "-Woverloaded-virtual",
+        "-Wnon-virtual-dtor",
+        "-Wimplicit-fallthrough",
+        "-Werror",
+        "-fno-omit-frame-pointer",
+        "-D_FORTIFY_SOURCE=2",
         "-o",
         cosmo_out,
         "smb.cpp",
