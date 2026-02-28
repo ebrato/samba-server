@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -27,8 +28,11 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifndef SMB_ENABLE_CONTRACTS
@@ -36,6 +40,7 @@
 #endif
 
 #ifdef _WIN32
+#include <bcrypt.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #if defined(_MSC_VER)
@@ -50,6 +55,9 @@ constexpr socket_t kInvalidSocket = INVALID_SOCKET;
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
 #include <unistd.h>
 using socket_t = int;
 using socket_len_t = socklen_t;
@@ -90,7 +98,12 @@ constexpr std::size_t kSmbMaxFrameBytes = 1024U * 1024U;
 constexpr std::size_t kDefaultMaxConcurrentClients = 128U;
 constexpr std::size_t kMaxRequestsPerConnection = 1024U;
 constexpr std::size_t kDefaultMaxOpenFilesPerConnection = 64U;
+constexpr std::size_t kDefaultMaxClientsPerIp = 8U;
+constexpr std::size_t kDefaultProductionMaxClientsPerIp = 4U;
 constexpr int kDefaultSocketTimeoutSeconds = 10;
+constexpr std::uint32_t kDefaultAuthFailWindowSeconds = 600U;
+constexpr std::size_t kDefaultAuthFailMax = 5U;
+constexpr std::uint32_t kDefaultAuthBlockSeconds = 1800U;
 constexpr std::uint64_t kDefaultMaxFileSizeBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kMinRecommendedPasswordLength = 8U;
 constexpr std::size_t kMinProductionPasswordLength = 12U;
@@ -203,12 +216,33 @@ static_assert(sizeof(NegotiateResponseBody) == 64U, "NegotiateResponseBody size 
 static_assert(sizeof(SessionSetupRequestBody) == 24U, "SessionSetupRequestBody size mismatch");
 static_assert(sizeof(SessionSetupResponseBody) == 8U, "SessionSetupResponseBody size mismatch");
 
+struct AbuseProtectionConfig {
+    std::size_t max_clients_per_ip{kDefaultMaxClientsPerIp};
+    std::uint32_t auth_fail_window_sec{kDefaultAuthFailWindowSeconds};
+    std::size_t auth_fail_max{kDefaultAuthFailMax};
+    std::uint32_t auth_block_sec{kDefaultAuthBlockSeconds};
+};
+
+struct IpSecurityState {
+    std::size_t active_connections{0U};
+    std::deque<std::uint64_t> auth_fail_times{};
+    std::uint64_t blocked_until_sec{0U};
+};
+
+enum class IpAcceptDecision : std::uint8_t {
+    Allow = 0,
+    Blocked,
+    ConnectionLimit,
+};
+
 std::atomic<std::uint64_t> g_next_session_id{1U};
 std::atomic<std::uint32_t> g_next_tree_id{1U};
 std::atomic<std::uint64_t> g_next_file_id{1U};
 std::atomic<std::size_t> g_active_clients{0U};
 volatile std::sig_atomic_t g_shutdown_requested = 0;
 std::mutex g_log_mutex;
+std::mutex g_ip_security_mutex;
+std::unordered_map<std::string, IpSecurityState> g_ip_security_states{};
 
 [[noreturn]] void contract_fail(const char* kind, const char* expr, const char* file, int line) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
@@ -253,6 +287,167 @@ std::mutex g_log_mutex;
 void log_line(const std::string& message) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
     std::cout << message << std::endl;
+}
+
+std::uint64_t monotonic_seconds() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now).count());
+}
+
+void prune_auth_failures_locked(IpSecurityState& st, std::uint64_t now_sec, std::uint32_t window_sec) {
+    while (!st.auth_fail_times.empty()) {
+        const std::uint64_t age = now_sec - st.auth_fail_times.front();
+        if (age <= static_cast<std::uint64_t>(window_sec)) {
+            break;
+        }
+        st.auth_fail_times.pop_front();
+    }
+}
+
+void maybe_cleanup_ip_state_locked(std::unordered_map<std::string, IpSecurityState>::iterator it, std::uint64_t now_sec) {
+    if (it->second.active_connections != 0U) {
+        return;
+    }
+    if (!it->second.auth_fail_times.empty()) {
+        return;
+    }
+    if (it->second.blocked_until_sec > now_sec) {
+        return;
+    }
+    g_ip_security_states.erase(it);
+}
+
+IpAcceptDecision try_acquire_ip_slot(const std::string& ip, const AbuseProtectionConfig& cfg) {
+    std::lock_guard<std::mutex> lock(g_ip_security_mutex);
+    const std::uint64_t now_sec = monotonic_seconds();
+    IpSecurityState& st = g_ip_security_states[ip];
+    prune_auth_failures_locked(st, now_sec, cfg.auth_fail_window_sec);
+    if (st.blocked_until_sec <= now_sec) {
+        st.blocked_until_sec = 0U;
+    }
+    if (st.blocked_until_sec > now_sec) {
+        return IpAcceptDecision::Blocked;
+    }
+    if (st.active_connections >= cfg.max_clients_per_ip) {
+        return IpAcceptDecision::ConnectionLimit;
+    }
+    st.active_connections += 1U;
+    return IpAcceptDecision::Allow;
+}
+
+void release_ip_slot(const std::string& ip) {
+    std::lock_guard<std::mutex> lock(g_ip_security_mutex);
+    const auto it = g_ip_security_states.find(ip);
+    if (it == g_ip_security_states.end()) {
+        return;
+    }
+    if (it->second.active_connections > 0U) {
+        it->second.active_connections -= 1U;
+    }
+    maybe_cleanup_ip_state_locked(it, monotonic_seconds());
+}
+
+bool ip_is_currently_blocked(const std::string& ip, const AbuseProtectionConfig& cfg) {
+    std::lock_guard<std::mutex> lock(g_ip_security_mutex);
+    const auto it = g_ip_security_states.find(ip);
+    if (it == g_ip_security_states.end()) {
+        return false;
+    }
+    IpSecurityState& st = it->second;
+    const std::uint64_t now_sec = monotonic_seconds();
+    prune_auth_failures_locked(st, now_sec, cfg.auth_fail_window_sec);
+    if (st.blocked_until_sec <= now_sec) {
+        st.blocked_until_sec = 0U;
+        maybe_cleanup_ip_state_locked(it, now_sec);
+        return false;
+    }
+    return true;
+}
+
+void record_auth_failure_for_ip(const std::string& ip, const AbuseProtectionConfig& cfg) {
+    if (ip.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_ip_security_mutex);
+    const std::uint64_t now_sec = monotonic_seconds();
+    IpSecurityState& st = g_ip_security_states[ip];
+    prune_auth_failures_locked(st, now_sec, cfg.auth_fail_window_sec);
+    st.auth_fail_times.push_back(now_sec);
+    if (st.auth_fail_times.size() >= cfg.auth_fail_max) {
+        st.blocked_until_sec = now_sec + static_cast<std::uint64_t>(cfg.auth_block_sec);
+        st.auth_fail_times.clear();
+    }
+}
+
+void record_auth_success_for_ip(const std::string& ip) {
+    if (ip.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_ip_security_mutex);
+    const auto it = g_ip_security_states.find(ip);
+    if (it == g_ip_security_states.end()) {
+        return;
+    }
+    it->second.auth_fail_times.clear();
+    maybe_cleanup_ip_state_locked(it, monotonic_seconds());
+}
+
+bool fill_secure_random_bytes(std::uint8_t* out, std::size_t len) {
+    SMB_EXPECT(out != nullptr || len == 0U);
+    if (len == 0U) {
+        return true;
+    }
+#ifdef _WIN32
+    std::size_t offset = 0U;
+    while (offset < len) {
+        const std::size_t chunk = std::min<std::size_t>(len - offset, static_cast<std::size_t>(ULONG_MAX));
+        const NTSTATUS rc = BCryptGenRandom(
+            nullptr,
+            reinterpret_cast<PUCHAR>(out + offset),
+            static_cast<ULONG>(chunk),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (rc != 0) {
+            return false;
+        }
+        offset += chunk;
+    }
+    return true;
+#else
+#if defined(__linux__)
+    std::size_t offset = 0U;
+    while (offset < len) {
+        const ssize_t rc = getrandom(out + offset, len - offset, 0);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (rc == 0) {
+            break;
+        }
+        offset += static_cast<std::size_t>(rc);
+    }
+    if (offset == len) {
+        return true;
+    }
+#endif
+    std::FILE* f = std::fopen("/dev/urandom", "rb");
+    if (f == nullptr) {
+        return false;
+    }
+    std::size_t read_total = 0U;
+    while (read_total < len) {
+        const std::size_t n = std::fread(out + read_total, 1U, len - read_total, f);
+        if (n == 0U) {
+            break;
+        }
+        read_total += n;
+    }
+    const bool ok = read_total == len;
+    (void)std::fclose(f);
+    return ok;
+#endif
 }
 
 // -------------------------------
@@ -435,6 +630,20 @@ bool set_socket_timeouts(socket_t sock, int timeout_seconds) {
 #endif
 }
 
+bool set_socket_keepalive(socket_t sock) {
+    int enabled = 1;
+#ifdef _WIN32
+    return setsockopt(
+               sock,
+               SOL_SOCKET,
+               SO_KEEPALIVE,
+               reinterpret_cast<const char*>(&enabled),
+               static_cast<int>(sizeof(enabled))) == 0;
+#else
+    return setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) == 0;
+#endif
+}
+
 void on_shutdown_signal(int /*signum*/) {
     g_shutdown_requested = 1;
 }
@@ -562,29 +771,29 @@ std::string client_address_string(const sockaddr_in& client_addr) {
     return std::string(text) + ":" + std::to_string(ntohs(client_addr.sin_port));
 }
 
+std::string client_ip_string(const sockaddr_in& client_addr) {
+    char ip_buf[INET_ADDRSTRLEN] = {};
+    const char* text = inet_ntop(AF_INET, &client_addr.sin_addr, ip_buf, sizeof(ip_buf));
+    if (text == nullptr) {
+        return "unknown";
+    }
+    return std::string(text);
+}
+
 // -----------------------------------
 // SMB packet parsing + serialization
 // -----------------------------------
 
-std::array<std::uint8_t, 16> create_server_guid() {
+std::optional<std::array<std::uint8_t, 16>> create_server_guid() {
     std::array<std::uint8_t, 16> guid{};
-
-    // Local deterministic fallback PRNG; no external crypto dependency.
-    std::uint64_t seed =
-        static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-    seed ^= static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&guid));
-
-    for (std::size_t i = 0U; i < guid.size(); ++i) {
-        seed ^= (seed << 13U);
-        seed ^= (seed >> 7U);
-        seed ^= (seed << 17U);
-        guid[i] = static_cast<std::uint8_t>(seed & 0xFFU);
+    if (!fill_secure_random_bytes(guid.data(), guid.size())) {
+        return std::nullopt;
     }
 
     // UUIDv4 layout bits.
     guid[6] = static_cast<std::uint8_t>((guid[6] & 0x0FU) | 0x40U);
     guid[8] = static_cast<std::uint8_t>((guid[8] & 0x3FU) | 0x80U);
-    return guid;
+    return std::make_optional(guid);
 }
 
 std::uint64_t now_windows_filetime_utc() {
@@ -884,9 +1093,11 @@ struct ConnectionState {
     bool signing_key_valid{false};
     std::array<std::uint8_t, 16> signing_key{};
     std::array<std::uint8_t, 8> ntlm_challenge{};
+    bool ntlm_challenge_valid{false};
     std::uint64_t session_id{0U};
     bool tree_connected{false};
     std::uint32_t tree_id{0U};
+    std::unordered_set<std::uint64_t> seen_signed_message_ids{};
     struct OpenFileHandle {
         std::uint64_t persistent_id{0U};
         std::uint64_t volatile_id{0U};
@@ -903,8 +1114,8 @@ struct ConnectionState {
 
 struct AuthConfig {
     bool require_auth{true};
-    bool auth_session_guest_compat{true};
-    bool allow_legacy_ntlm{true};
+    bool auth_session_guest_compat{false};
+    bool allow_legacy_ntlm{false};
     bool signing_enabled{false};
     bool signing_required{false};
     std::string username{};
@@ -2574,18 +2785,12 @@ std::optional<std::uint32_t> extract_ntlm_message_type(const std::uint8_t* blob_
     return type;
 }
 
-std::array<std::uint8_t, 8> make_ntlm_server_challenge() {
+std::optional<std::array<std::uint8_t, 8>> make_ntlm_server_challenge() {
     std::array<std::uint8_t, 8> challenge{};
-    const std::uint64_t seed = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^
-                               g_next_session_id.load(std::memory_order_relaxed);
-    std::uint64_t x = seed;
-    for (std::size_t i = 0U; i < challenge.size(); ++i) {
-        x ^= (x << 13U);
-        x ^= (x >> 7U);
-        x ^= (x << 17U);
-        challenge[i] = static_cast<std::uint8_t>(x & 0xFFU);
+    if (!fill_secure_random_bytes(challenge.data(), challenge.size())) {
+        return std::nullopt;
     }
-    return challenge;
+    return std::make_optional(challenge);
 }
 
 void append_asn1_length(std::vector<std::uint8_t>& out, std::size_t len) {
@@ -3794,59 +3999,49 @@ bool verify_ntlm_type3_ntlmv2(const std::uint8_t* blob_data,
     const std::array<std::uint8_t, 16> nt_hash = md4_hash(pass_utf16);
     std::vector<std::uint8_t> nt_hash_key(nt_hash.begin(), nt_hash.end());
 
-    if (fields.nt_response_len > 24U) {
-        std::vector<std::string> user_candidates{};
-        (void)push_unique_non_empty(user_candidates, fields.username);
-        (void)push_unique_non_empty(user_candidates, canonical_user);
-        (void)push_unique_non_empty(user_candidates, auth.username);
+    if (fields.nt_response_len <= 24U) {
+        return false;
+    }
+    std::vector<std::string> user_candidates{};
+    (void)push_unique_non_empty(user_candidates, fields.username);
+    (void)push_unique_non_empty(user_candidates, canonical_user);
+    (void)push_unique_non_empty(user_candidates, auth.username);
 
-        std::vector<std::string> domain_candidates{};
-        (void)push_unique_non_empty(domain_candidates, fields.domain);
-        (void)push_unique_non_empty(domain_candidates, domain_from_qualified_username(fields.username));
-        (void)push_unique_non_empty(domain_candidates, ascii_upper_copy(fields.domain));
-        (void)push_unique_non_empty(domain_candidates, ascii_lower_copy(fields.domain));
-        domain_candidates.push_back(std::string{});  // many clients send/expect empty domain in NTLMv2 hash
+    std::vector<std::string> domain_candidates{};
+    (void)push_unique_non_empty(domain_candidates, fields.domain);
+    (void)push_unique_non_empty(domain_candidates, domain_from_qualified_username(fields.username));
+    (void)push_unique_non_empty(domain_candidates, ascii_upper_copy(fields.domain));
+    (void)push_unique_non_empty(domain_candidates, ascii_lower_copy(fields.domain));
+    domain_candidates.push_back(std::string{});  // many clients send/expect empty domain in NTLMv2 hash
 
-        const std::size_t blob_part_len = fields.nt_response_len - 16U;
-        std::vector<std::uint8_t> proof_input{};
-        proof_input.reserve(challenge.size() + blob_part_len);
-        proof_input.insert(proof_input.end(), challenge.begin(), challenge.end());
-        proof_input.insert(proof_input.end(),
-                           fields.nt_response + 16U,
-                           fields.nt_response + fields.nt_response_len);
+    const std::size_t blob_part_len = fields.nt_response_len - 16U;
+    std::vector<std::uint8_t> proof_input{};
+    proof_input.reserve(challenge.size() + blob_part_len);
+    proof_input.insert(proof_input.end(), challenge.begin(), challenge.end());
+    proof_input.insert(proof_input.end(),
+                       fields.nt_response + 16U,
+                       fields.nt_response + fields.nt_response_len);
 
-        for (const auto& user_for_hash : user_candidates) {
-            const std::vector<std::uint8_t> user_utf16 = to_utf16le_ascii(user_for_hash, true);
-            for (const auto& domain_for_hash : domain_candidates) {
-                std::vector<std::uint8_t> identity = user_utf16;
-                const std::vector<std::uint8_t> domain_utf16 = to_utf16le_ascii(domain_for_hash, false);
-                identity.insert(identity.end(), domain_utf16.begin(), domain_utf16.end());
-                const std::array<std::uint8_t, 16> ntlm_v2_hash = hmac_md5(nt_hash_key, identity);
-                std::vector<std::uint8_t> ntlm_v2_key(ntlm_v2_hash.begin(), ntlm_v2_hash.end());
-                const std::array<std::uint8_t, 16> expected_proof = hmac_md5(ntlm_v2_key, proof_input);
-                if (constant_time_equal_bytes(fields.nt_response, expected_proof.data(), expected_proof.size())) {
-                    if (out_session_key != nullptr) {
-                        std::vector<std::uint8_t> nt_proof(fields.nt_response, fields.nt_response + 16U);
-                        const std::array<std::uint8_t, 16> session_base_key = hmac_md5(ntlm_v2_key, nt_proof);
-                        *out_session_key = apply_ntlm_key_exchange_if_needed(fields, session_base_key);
-                    }
-                    return true;
+    for (const auto& user_for_hash : user_candidates) {
+        const std::vector<std::uint8_t> user_utf16 = to_utf16le_ascii(user_for_hash, true);
+        for (const auto& domain_for_hash : domain_candidates) {
+            std::vector<std::uint8_t> identity = user_utf16;
+            const std::vector<std::uint8_t> domain_utf16 = to_utf16le_ascii(domain_for_hash, false);
+            identity.insert(identity.end(), domain_utf16.begin(), domain_utf16.end());
+            const std::array<std::uint8_t, 16> ntlm_v2_hash = hmac_md5(nt_hash_key, identity);
+            std::vector<std::uint8_t> ntlm_v2_key(ntlm_v2_hash.begin(), ntlm_v2_hash.end());
+            const std::array<std::uint8_t, 16> expected_proof = hmac_md5(ntlm_v2_key, proof_input);
+            if (constant_time_equal_bytes(fields.nt_response, expected_proof.data(), expected_proof.size())) {
+                if (out_session_key != nullptr) {
+                    std::vector<std::uint8_t> nt_proof(fields.nt_response, fields.nt_response + 16U);
+                    const std::array<std::uint8_t, 16> session_base_key = hmac_md5(ntlm_v2_key, nt_proof);
+                    *out_session_key = apply_ntlm_key_exchange_if_needed(fields, session_base_key);
                 }
+                return true;
             }
         }
     }
-
-    if (!auth.allow_legacy_ntlm) {
-        return false;
-    }
-    if (!verify_ntlm_legacy_response(fields, nt_hash, challenge)) {
-        return false;
-    }
-    if (out_session_key != nullptr) {
-        const std::array<std::uint8_t, 16> nt_hash_hash = md4_hash(nt_hash_key);
-        *out_session_key = apply_ntlm_key_exchange_if_needed(fields, nt_hash_hash);
-    }
-    return true;
+    return false;
 }
 
 bool is_authenticated_and_tree_ready(const ParsedRequestHeader& parsed, const ConnectionState& state) {
@@ -4087,6 +4282,8 @@ RequestResult process_request_single(const std::vector<std::uint8_t>& payload,
                                     const AuthConfig& auth,
                                     const std::string& share_dir,
                                     const ShareSecurityConfig& hardening,
+                                    const std::string& client_ip,
+                                    const AbuseProtectionConfig& abuse_cfg,
                                     const std::array<std::uint8_t, 16>& server_guid,
                                     std::uint64_t start_time_filetime) {
     const auto parsed = parse_request_header(payload);
@@ -4109,6 +4306,9 @@ RequestResult process_request_single(const std::vector<std::uint8_t>& payload,
         state.session_setup_token_sent = false;
         state.signing_key_valid = false;
         state.signing_key.fill(0U);
+        state.ntlm_challenge_sent = false;
+        state.ntlm_challenge_valid = false;
+        state.seen_signed_message_ids.clear();
         state.session_id = 0U;
         state.tree_connected = false;
         state.tree_id = 0U;
@@ -4164,6 +4364,19 @@ RequestResult process_request_single(const std::vector<std::uint8_t>& payload,
             state.session_id = 0U;
             state.tree_connected = false;
             state.tree_id = 0U;
+            state.ntlm_challenge_valid = false;
+            state.seen_signed_message_ids.clear();
+        };
+        const auto fail_logon = [&]() -> RequestResult {
+            reset_auth_state();
+            record_auth_failure_for_ip(client_ip, abuse_cfg);
+            log_line("[warn] auth failure ip=" + client_ip);
+            return {build_error_response(parsed->message_id,
+                                         parsed->command,
+                                         kStatusLogonFailure,
+                                         parsed->session_id,
+                                         parsed->tree_id),
+                    false};
         };
 
         if (!auth.require_auth) {
@@ -4176,7 +4389,9 @@ RequestResult process_request_single(const std::vector<std::uint8_t>& payload,
                 state.signing_key.fill(0U);
                 state.tree_connected = false;
                 state.tree_id = 0U;
+                state.ntlm_challenge_valid = false;
                 close_all_open_files(state);
+                state.seen_signed_message_ids.clear();
             }
             std::vector<std::uint8_t> out_token{};
             std::uint16_t out_flags = 0U;
@@ -4201,8 +4416,19 @@ RequestResult process_request_single(const std::vector<std::uint8_t>& payload,
             state.signing_key_valid = false;
             state.signing_key.fill(0U);
             close_all_open_files(state);
-            state.ntlm_challenge = make_ntlm_server_challenge();
+            const auto challenge = make_ntlm_server_challenge();
+            if (!challenge.has_value()) {
+                reset_auth_state();
+                return {build_error_response(parsed->message_id,
+                                             parsed->command,
+                                             kStatusInternalError,
+                                             parsed->session_id,
+                                             parsed->tree_id),
+                        false};
+            }
+            state.ntlm_challenge = challenge.value();
             state.ntlm_challenge_sent = true;
+            state.ntlm_challenge_valid = true;
             const std::vector<std::uint8_t> challenge_token = build_ntlm_type2_challenge_token(state.ntlm_challenge);
             return {build_session_setup_response(parsed->message_id,
                                                  state.session_id,
@@ -4213,58 +4439,12 @@ RequestResult process_request_single(const std::vector<std::uint8_t>& payload,
         }
 
         if (blob_starts_with_user_pass_auth(blob_data, blob_size)) {
-            if (!authenticate_user_pass_session_blob(blob_data, blob_size, auth)) {
-                reset_auth_state();
-                return {build_error_response(parsed->message_id,
-                                             parsed->command,
-                                             kStatusLogonFailure,
-                                             parsed->session_id,
-                                             parsed->tree_id),
-                        false};
-            }
-            if (!state.session_established) {
-                state.session_id = g_next_session_id.fetch_add(1U, std::memory_order_relaxed);
-                state.session_established = true;
-                state.tree_connected = false;
-                state.tree_id = 0U;
-                state.ntlm_challenge_sent = false;
-                close_all_open_files(state);
-            }
-            if (auth.signing_enabled) {
-                std::array<std::uint8_t, 16> signing_key{};
-                if (!derive_userpass_signing_key(auth.username, auth.password, signing_key)) {
-                    reset_auth_state();
-                    return {build_error_response(parsed->message_id,
-                                                 parsed->command,
-                                                 kStatusLogonFailure,
-                                                 parsed->session_id,
-                                                 parsed->tree_id),
-                            false};
-                }
-                state.signing_key = signing_key;
-                state.signing_key_valid = true;
-            } else {
-                state.signing_key_valid = false;
-                state.signing_key.fill(0U);
-            }
-            return {build_session_setup_response(
-                        parsed->message_id,
-                        state.session_id,
-                        kStatusSuccess,
-                        auth.auth_session_guest_compat ? 0x0001U : 0U,
-                        kSpnegoAcceptCompleted),
-                    true};
+            return fail_logon();
         }
 
         const auto ntlm_type = extract_ntlm_message_type(blob_data, blob_size);
         if (!ntlm_type.has_value()) {
-            reset_auth_state();
-            return {build_error_response(parsed->message_id,
-                                         parsed->command,
-                                         kStatusLogonFailure,
-                                         parsed->session_id,
-                                         parsed->tree_id),
-                    false};
+            return fail_logon();
         }
         if (ntlm_type.value() == 1U) {
             if (state.session_id == 0U) {
@@ -4276,8 +4456,19 @@ RequestResult process_request_single(const std::vector<std::uint8_t>& payload,
             state.signing_key_valid = false;
             state.signing_key.fill(0U);
             close_all_open_files(state);
-            state.ntlm_challenge = make_ntlm_server_challenge();
+            const auto challenge = make_ntlm_server_challenge();
+            if (!challenge.has_value()) {
+                reset_auth_state();
+                return {build_error_response(parsed->message_id,
+                                             parsed->command,
+                                             kStatusInternalError,
+                                             parsed->session_id,
+                                             parsed->tree_id),
+                        false};
+            }
+            state.ntlm_challenge = challenge.value();
             state.ntlm_challenge_sent = true;
+            state.ntlm_challenge_valid = true;
             const std::vector<std::uint8_t> challenge_token = build_ntlm_type2_challenge_token(state.ntlm_challenge);
             return {build_session_setup_response(parsed->message_id,
                                                  state.session_id,
@@ -4287,29 +4478,18 @@ RequestResult process_request_single(const std::vector<std::uint8_t>& payload,
                     true};
         }
         if (ntlm_type.value() == 3U) {
-            if ((state.session_id == 0U) || !state.ntlm_challenge_sent ||
+            if ((state.session_id == 0U) || !state.ntlm_challenge_sent || !state.ntlm_challenge_valid ||
                 ((parsed->session_id != 0U) && (parsed->session_id != state.session_id))) {
-                reset_auth_state();
-                return {build_error_response(parsed->message_id,
-                                             parsed->command,
-                                             kStatusLogonFailure,
-                                             parsed->session_id,
-                                             parsed->tree_id),
-                        false};
+                return fail_logon();
             }
             std::array<std::uint8_t, 16> ntlm_session_key{};
             if (!verify_ntlm_type3_ntlmv2(blob_data, blob_size, auth, state.ntlm_challenge, &ntlm_session_key)) {
-                reset_auth_state();
-                return {build_error_response(parsed->message_id,
-                                             parsed->command,
-                                             kStatusLogonFailure,
-                                             parsed->session_id,
-                                             parsed->tree_id),
-                        false};
+                return fail_logon();
             }
             state.session_established = true;
             state.session_setup_token_sent = true;
             state.ntlm_challenge_sent = false;
+            state.ntlm_challenge_valid = false;
             state.tree_connected = false;
             state.tree_id = 0U;
             if (auth.signing_enabled) {
@@ -4320,6 +4500,8 @@ RequestResult process_request_single(const std::vector<std::uint8_t>& payload,
                 state.signing_key.fill(0U);
             }
             close_all_open_files(state);
+            state.seen_signed_message_ids.clear();
+            record_auth_success_for_ip(client_ip);
             return {build_session_setup_response(
                         parsed->message_id,
                         state.session_id,
@@ -4329,13 +4511,7 @@ RequestResult process_request_single(const std::vector<std::uint8_t>& payload,
                     true};
         }
 
-        reset_auth_state();
-        return {build_error_response(parsed->message_id,
-                                     parsed->command,
-                                     kStatusLogonFailure,
-                                     parsed->session_id,
-                                     parsed->tree_id),
-                false};
+        return fail_logon();
     }
 
     if (parsed->command == static_cast<std::uint16_t>(Smb2Command::Logoff)) {
@@ -4360,8 +4536,10 @@ RequestResult process_request_single(const std::vector<std::uint8_t>& payload,
         state.session_established = false;
         state.session_setup_token_sent = false;
         state.ntlm_challenge_sent = false;
+        state.ntlm_challenge_valid = false;
         state.signing_key_valid = false;
         state.signing_key.fill(0U);
+        state.seen_signed_message_ids.clear();
         state.session_id = 0U;
         state.tree_connected = false;
         state.tree_id = 0U;
@@ -5451,6 +5629,8 @@ RequestResult process_request(const std::vector<std::uint8_t>& payload,
                               const AuthConfig& auth,
                               const std::string& share_dir,
                               const ShareSecurityConfig& hardening,
+                              const std::string& client_ip,
+                              const AbuseProtectionConfig& abuse_cfg,
                               const std::array<std::uint8_t, 16>& server_guid,
                               std::uint64_t start_time_filetime) {
     const auto first = parse_request_header(payload);
@@ -5469,6 +5649,15 @@ RequestResult process_request(const std::vector<std::uint8_t>& payload,
         }
         return {std::move(response), keep};
     };
+
+    if (first->next_command != 0U) {
+        return finalize(build_error_response(first->message_id,
+                                             first->command,
+                                             kStatusInvalidParameter,
+                                             first->session_id,
+                                             first->tree_id),
+                        false);
+    }
 
     if (auth.signing_enabled &&
         state.session_established &&
@@ -5491,92 +5680,44 @@ RequestResult process_request(const std::vector<std::uint8_t>& payload,
                                                  first->tree_id),
                             false);
         }
-    }
-
-    std::vector<std::vector<std::uint8_t>> responses{};
-    responses.reserve(4U);
-    bool keep_connection = true;
-    std::size_t offset = 0U;
-
-    while (offset < payload.size()) {
-        if ((payload.size() - offset) < sizeof(Smb2Header)) {
-            return finalize(build_error_response(first->message_id,
-                                                 first->command,
-                                                 kStatusInvalidParameter,
-                                                 first->session_id,
-                                                 first->tree_id),
-                            false);
-        }
-
-        std::uint32_t next_command = 0U;
-        if (!read_wire_u32(payload, offset + 20U, next_command)) {
-            return finalize(build_error_response(first->message_id,
-                                                 first->command,
-                                                 kStatusInvalidParameter,
-                                                 first->session_id,
-                                                 first->tree_id),
-                            false);
-        }
-        const std::size_t request_end =
-            (next_command == 0U) ? payload.size() : (offset + static_cast<std::size_t>(next_command));
-        if ((next_command != 0U) &&
-            ((next_command < sizeof(Smb2Header)) || ((next_command % 8U) != 0U) || (request_end > payload.size()))) {
-            return finalize(build_error_response(first->message_id,
-                                                 first->command,
-                                                 kStatusInvalidParameter,
-                                                 first->session_id,
-                                                 first->tree_id),
-                            false);
-        }
-
-        std::vector<std::uint8_t> sub_payload(payload.begin() + static_cast<std::ptrdiff_t>(offset),
-                                              payload.begin() + static_cast<std::ptrdiff_t>(request_end));
-        write_le32_at(sub_payload, 20U, 0U);
-        RequestResult one =
-            process_request_single(sub_payload, state, auth, share_dir, hardening, server_guid, start_time_filetime);
-        if (one.payload.empty()) {
-            return one;
-        }
-        responses.push_back(std::move(one.payload));
-        keep_connection = keep_connection && one.keep_connection;
-
-        if (next_command == 0U) {
-            break;
-        }
-        offset = request_end;
-    }
-
-    if (responses.empty()) {
-        return {std::vector<std::uint8_t>{}, false};
-    }
-    if (responses.size() == 1U) {
-        return finalize(std::move(responses[0]), keep_connection);
-    }
-
-    std::vector<std::uint8_t> combined{};
-    std::vector<std::size_t> starts{};
-    starts.reserve(responses.size());
-    for (std::size_t i = 0U; i < responses.size(); ++i) {
-        starts.push_back(combined.size());
-        combined.insert(combined.end(), responses[i].begin(), responses[i].end());
-        if ((i + 1U) < responses.size()) {
-            const std::size_t pad = (8U - (combined.size() % 8U)) % 8U;
-            combined.insert(combined.end(), pad, 0U);
+        if (request_signed) {
+            const auto inserted = state.seen_signed_message_ids.insert(first->message_id);
+            if (!inserted.second) {
+                return finalize(build_error_response(first->message_id,
+                                                     first->command,
+                                                     kStatusAccessDenied,
+                                                     first->session_id,
+                                                     first->tree_id),
+                                false);
+            }
         }
     }
-    for (std::size_t i = 0U; (i + 1U) < starts.size(); ++i) {
-        const std::size_t delta = starts[i + 1U] - starts[i];
-        if (delta > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
-            return finalize(build_error_response(first->message_id,
-                                                 first->command,
-                                                 kStatusInternalError,
-                                                 first->session_id,
-                                                 first->tree_id),
-                            false);
-        }
-        write_le32_at(combined, starts[i] + 20U, static_cast<std::uint32_t>(delta));
+
+    RequestResult one =
+        process_request_single(payload, state, auth, share_dir, hardening, client_ip, abuse_cfg, server_guid, start_time_filetime);
+    if (one.payload.empty()) {
+        return one;
     }
-    return finalize(std::move(combined), keep_connection, false);
+    return finalize(std::move(one.payload), one.keep_connection);
+}
+
+RequestResult process_request(const std::vector<std::uint8_t>& payload,
+                              ConnectionState& state,
+                              const AuthConfig& auth,
+                              const std::string& share_dir,
+                              const ShareSecurityConfig& hardening,
+                              const std::array<std::uint8_t, 16>& server_guid,
+                              std::uint64_t start_time_filetime) {
+    static const AbuseProtectionConfig kLocalAbuse{};
+    return process_request(payload,
+                           state,
+                           auth,
+                           share_dir,
+                           hardening,
+                           std::string("127.0.0.1"),
+                           kLocalAbuse,
+                           server_guid,
+                           start_time_filetime);
 }
 
 // -------------------------------
@@ -5595,6 +5736,7 @@ struct ServerConfig {
     std::string share_dir{"."};
     AuthConfig auth{};
     ShareSecurityConfig hardening{};
+    AbuseProtectionConfig abuse{};
 };
 
 bool resolve_and_validate_share_dir(const std::string& input_dir, std::string& out_dir) {
@@ -5623,11 +5765,13 @@ bool resolve_and_validate_share_dir(const std::string& input_dir, std::string& o
 
 void handle_client(socket_t client,
                    const std::string& peer,
+                   const std::string& peer_ip,
                    const ServerConfig& cfg,
                    const std::array<std::uint8_t, 16>& server_guid,
                    std::uint64_t start_time_filetime) {
     SMB_EXPECT(client != kInvalidSocket);
     (void)set_socket_timeouts(client, cfg.timeout_seconds);
+    (void)set_socket_keepalive(client);
 
     ConnectionState state{};
     for (std::size_t request_idx = 0U; request_idx < kMaxRequestsPerConnection; ++request_idx) {
@@ -5641,7 +5785,15 @@ void handle_client(socket_t client,
 
         const RequestResult result =
             process_request(
-                frame.payload, state, cfg.auth, cfg.share_dir, cfg.hardening, server_guid, start_time_filetime);
+                frame.payload,
+                state,
+                cfg.auth,
+                cfg.share_dir,
+                cfg.hardening,
+                peer_ip,
+                cfg.abuse,
+                server_guid,
+                start_time_filetime);
         if (result.payload.empty()) {
             break;
         }
@@ -5703,6 +5855,11 @@ int run_server(const ServerConfig& cfg) {
         std::cerr << "[error] invalid hardening limits (--max-open-files / --max-file-size)" << std::endl;
         return static_cast<int>(ExitCode::InvalidArguments);
     }
+    if ((cfg.abuse.max_clients_per_ip == 0U) || (cfg.abuse.auth_fail_window_sec == 0U) ||
+        (cfg.abuse.auth_fail_max == 0U) || (cfg.abuse.auth_block_sec == 0U)) {
+        std::cerr << "[error] invalid anti-abuse limits (--max-clients-per-ip / --auth-fail-*)" << std::endl;
+        return static_cast<int>(ExitCode::InvalidArguments);
+    }
     std::string normalized_share_dir{};
     if (!resolve_and_validate_share_dir(cfg.share_dir, normalized_share_dir)) {
         std::cerr << "[error] invalid --share-dir: '" << cfg.share_dir << "'" << std::endl;
@@ -5711,6 +5868,10 @@ int run_server(const ServerConfig& cfg) {
     ServerConfig runtime_cfg = cfg;
     runtime_cfg.share_dir = normalized_share_dir;
     g_shutdown_requested = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_ip_security_mutex);
+        g_ip_security_states.clear();
+    }
     install_shutdown_signal_handlers();
 
     const socket_t listener = create_listener(runtime_cfg.port);
@@ -5728,7 +5889,13 @@ int run_server(const ServerConfig& cfg) {
         return static_cast<int>(ExitCode::GenericError);
     }
 
-    const std::array<std::uint8_t, 16> server_guid = create_server_guid();
+    const auto server_guid_opt = create_server_guid();
+    if (!server_guid_opt.has_value()) {
+        std::cerr << "[error] failed to initialize secure random source for server GUID" << std::endl;
+        close_socket(listener);
+        return static_cast<int>(ExitCode::GenericError);
+    }
+    const std::array<std::uint8_t, 16> server_guid = server_guid_opt.value();
     const std::uint64_t start_time_filetime = now_windows_filetime_utc();
     if (runtime_cfg.verbose) {
         log_line("[info] listening on TCP port " + std::to_string(runtime_cfg.port));
@@ -5738,7 +5905,11 @@ int run_server(const ServerConfig& cfg) {
                  ", deny_dot_files=" + std::string(runtime_cfg.hardening.deny_dot_files ? "true" : "false") +
                  ", allow_legacy_ntlm=" + std::string(runtime_cfg.auth.allow_legacy_ntlm ? "true" : "false") +
                  ", signing_enabled=" + std::string(runtime_cfg.auth.signing_enabled ? "true" : "false") +
-                 ", signing_required=" + std::string(runtime_cfg.auth.signing_required ? "true" : "false"));
+                 ", signing_required=" + std::string(runtime_cfg.auth.signing_required ? "true" : "false") +
+                 ", max_clients_per_ip=" + std::to_string(runtime_cfg.abuse.max_clients_per_ip) +
+                 ", auth_fail_window_sec=" + std::to_string(runtime_cfg.abuse.auth_fail_window_sec) +
+                 ", auth_fail_max=" + std::to_string(runtime_cfg.abuse.auth_fail_max) +
+                 ", auth_block_sec=" + std::to_string(runtime_cfg.abuse.auth_block_sec));
         if (runtime_cfg.production_profile) {
             log_line("[info] production profile enabled");
         }
@@ -5758,9 +5929,25 @@ int run_server(const ServerConfig& cfg) {
             continue;
         }
 
+        const std::string peer_ip = client_ip_string(client_addr);
+        const std::string peer = client_address_string(client_addr);
+        const IpAcceptDecision ip_accept = try_acquire_ip_slot(peer_ip, runtime_cfg.abuse);
+        if (ip_accept != IpAcceptDecision::Allow) {
+            close_socket(client);
+            if (runtime_cfg.verbose) {
+                if (ip_accept == IpAcceptDecision::Blocked) {
+                    log_line("[warn] connection rejected: IP temporarily blocked (" + peer_ip + ")");
+                } else {
+                    log_line("[warn] connection rejected: per-IP limit reached (" + peer_ip + ")");
+                }
+            }
+            continue;
+        }
+
         const std::size_t active_now = g_active_clients.fetch_add(1U, std::memory_order_acq_rel) + 1U;
         if (active_now > runtime_cfg.max_clients) {
             (void)g_active_clients.fetch_sub(1U, std::memory_order_acq_rel);
+            release_ip_slot(peer_ip);
             close_socket(client);
             if (runtime_cfg.verbose) {
                 log_line("[warn] connection rejected: max clients reached");
@@ -5768,21 +5955,24 @@ int run_server(const ServerConfig& cfg) {
             continue;
         }
 
-        const std::string peer = client_address_string(client_addr);
         if (runtime_cfg.once) {
-            handle_client(client, peer, runtime_cfg, server_guid, start_time_filetime);
+            handle_client(client, peer, peer_ip, runtime_cfg, server_guid, start_time_filetime);
             (void)g_active_clients.fetch_sub(1U, std::memory_order_acq_rel);
+            release_ip_slot(peer_ip);
             break;
         }
 
-        std::thread t([client, peer, runtime_cfg, server_guid, start_time_filetime]() {
+        std::thread t([client, peer, peer_ip, runtime_cfg, server_guid, start_time_filetime]() {
             struct ActiveGuard {
+                std::string ip{};
+                explicit ActiveGuard(std::string peer_ip_value) : ip(std::move(peer_ip_value)) {}
                 ~ActiveGuard() {
                     (void)g_active_clients.fetch_sub(1U, std::memory_order_acq_rel);
+                    release_ip_slot(ip);
                 }
-            } guard;
+            } guard(peer_ip);
             SMB_INVARIANT(g_active_clients.load(std::memory_order_relaxed) <= runtime_cfg.max_clients);
-            handle_client(client, peer, runtime_cfg, server_guid, start_time_filetime);
+            handle_client(client, peer, peer_ip, runtime_cfg, server_guid, start_time_filetime);
         });
         t.detach();
     }
@@ -5875,22 +6065,31 @@ std::vector<std::uint8_t> make_negotiate_request_payload(std::uint64_t message_i
     return payload;
 }
 
+std::vector<std::uint8_t> make_session_setup_request_payload_with_blob(std::uint64_t message_id,
+                                                                       std::uint64_t session_id,
+                                                                       const std::vector<std::uint8_t>& security_blob);
+
 std::vector<std::uint8_t> make_session_setup_request_payload(std::uint64_t message_id,
                                                              const std::string& username,
                                                              const std::string& password,
                                                              bool include_auth_blob) {
-    std::vector<std::uint8_t> payload = make_smb2_request_header(static_cast<std::uint16_t>(Smb2Command::SessionSetup),
-                                                                 message_id,
-                                                                 0U,
-                                                                 0U);
     std::string auth_blob{};
     if (include_auth_blob) {
         auth_blob = "USER=" + username + ";PASS=" + password;
     }
-    SMB_EXPECT(auth_blob.size() <= static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()));
+    std::vector<std::uint8_t> security_blob(auth_blob.begin(), auth_blob.end());
+    return make_session_setup_request_payload_with_blob(message_id, 0U, security_blob);
+}
+
+std::vector<std::uint8_t> make_session_setup_request_payload_with_blob(std::uint64_t message_id,
+                                                                       std::uint64_t session_id,
+                                                                       const std::vector<std::uint8_t>& security_blob) {
+    std::vector<std::uint8_t> payload = make_smb2_request_header(
+        static_cast<std::uint16_t>(Smb2Command::SessionSetup), message_id, session_id, 0U);
+    SMB_EXPECT(security_blob.size() <= static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()));
     const std::uint16_t sec_offset =
         static_cast<std::uint16_t>(sizeof(Smb2Header) + sizeof(SessionSetupRequestBody));
-    const std::uint16_t sec_length = static_cast<std::uint16_t>(auth_blob.size());
+    const std::uint16_t sec_length = static_cast<std::uint16_t>(security_blob.size());
 
     push_le16(payload, 25U);
     payload.push_back(0U);
@@ -5900,10 +6099,151 @@ std::vector<std::uint8_t> make_session_setup_request_payload(std::uint64_t messa
     push_le16(payload, sec_offset);
     push_le16(payload, sec_length);
     push_le64(payload, 0U);
-    for (char c : auth_blob) {
-        payload.push_back(static_cast<std::uint8_t>(c));
-    }
+    payload.insert(payload.end(), security_blob.begin(), security_blob.end());
     return payload;
+}
+
+std::vector<std::uint8_t> make_ntlm_type1_security_blob() {
+    std::vector<std::uint8_t> out(40U, 0U);
+    std::memcpy(out.data(), "NTLMSSP\0", 8U);
+    const std::uint32_t type_le = to_le32(1U);
+    const std::uint32_t flags_le = to_le32(0x00088201U);
+    std::memcpy(out.data() + 8U, &type_le, sizeof(type_le));
+    std::memcpy(out.data() + 12U, &flags_le, sizeof(flags_le));
+    return out;
+}
+
+bool extract_session_setup_response_security_blob(const std::vector<std::uint8_t>& response,
+                                                  const std::uint8_t*& blob_data,
+                                                  std::size_t& blob_size) {
+    blob_data = nullptr;
+    blob_size = 0U;
+    if (response.size() < (sizeof(Smb2Header) + sizeof(SessionSetupResponseBody))) {
+        return false;
+    }
+    const std::uint16_t offset = read_le16(response.data() + sizeof(Smb2Header) + 4U);
+    const std::uint16_t length = read_le16(response.data() + sizeof(Smb2Header) + 6U);
+    if (length == 0U) {
+        return true;
+    }
+    const std::size_t begin = static_cast<std::size_t>(offset);
+    const std::size_t end = begin + static_cast<std::size_t>(length);
+    if ((begin < (sizeof(Smb2Header) + sizeof(SessionSetupResponseBody))) || (end > response.size())) {
+        return false;
+    }
+    blob_data = response.data() + begin;
+    blob_size = static_cast<std::size_t>(length);
+    return true;
+}
+
+bool extract_ntlm_type2_challenge(const std::uint8_t* blob_data,
+                                  std::size_t blob_size,
+                                  std::array<std::uint8_t, 8>& out_challenge) {
+    SMB_EXPECT(blob_data != nullptr);
+    const auto sig_offset = find_ntlmssp_signature(blob_data, blob_size);
+    if (!sig_offset.has_value()) {
+        return false;
+    }
+    const std::size_t base = sig_offset.value();
+    const auto msg_type = extract_ntlm_message_type(blob_data, blob_size);
+    if (!msg_type.has_value() || (msg_type.value() != 2U)) {
+        return false;
+    }
+    if ((base + 32U) > blob_size) {
+        return false;
+    }
+    std::memcpy(out_challenge.data(), blob_data + base + 24U, out_challenge.size());
+    return true;
+}
+
+bool build_ntlmv2_type3_security_blob(const std::string& username,
+                                      const std::string& password,
+                                      const std::array<std::uint8_t, 8>& server_challenge,
+                                      std::vector<std::uint8_t>& out_blob,
+                                      std::array<std::uint8_t, 16>& out_session_key) {
+    out_blob.clear();
+    out_session_key.fill(0U);
+    if (username.empty() || password.empty()) {
+        return false;
+    }
+
+    std::array<std::uint8_t, 8> client_challenge{};
+    if (!fill_secure_random_bytes(client_challenge.data(), client_challenge.size())) {
+        return false;
+    }
+
+    const std::vector<std::uint8_t> pass_utf16 = to_utf16le_ascii(password, false);
+    const std::array<std::uint8_t, 16> nt_hash = md4_hash(pass_utf16);
+    std::vector<std::uint8_t> nt_hash_key(nt_hash.begin(), nt_hash.end());
+
+    const std::string canonical_user = strip_qualified_username(username);
+    const std::vector<std::uint8_t> user_utf16_upper = to_utf16le_ascii(ascii_upper_copy(canonical_user), false);
+    std::vector<std::uint8_t> identity = user_utf16_upper;
+    const std::array<std::uint8_t, 16> ntlm_v2_hash = hmac_md5(nt_hash_key, identity);
+    std::vector<std::uint8_t> ntlm_v2_key(ntlm_v2_hash.begin(), ntlm_v2_hash.end());
+
+    std::vector<std::uint8_t> blob_part(32U, 0U);
+    blob_part[0U] = 0x01U;
+    blob_part[1U] = 0x01U;
+    const std::uint64_t ts_le = to_le64(now_windows_filetime_utc());
+    std::memcpy(blob_part.data() + 8U, &ts_le, sizeof(ts_le));
+    std::memcpy(blob_part.data() + 16U, client_challenge.data(), client_challenge.size());
+
+    std::vector<std::uint8_t> proof_input{};
+    proof_input.reserve(server_challenge.size() + blob_part.size());
+    proof_input.insert(proof_input.end(), server_challenge.begin(), server_challenge.end());
+    proof_input.insert(proof_input.end(), blob_part.begin(), blob_part.end());
+    const std::array<std::uint8_t, 16> nt_proof = hmac_md5(ntlm_v2_key, proof_input);
+
+    std::vector<std::uint8_t> nt_response{};
+    nt_response.reserve(nt_proof.size() + blob_part.size());
+    nt_response.insert(nt_response.end(), nt_proof.begin(), nt_proof.end());
+    nt_response.insert(nt_response.end(), blob_part.begin(), blob_part.end());
+
+    std::vector<std::uint8_t> nt_proof_vec(nt_proof.begin(), nt_proof.end());
+    out_session_key = hmac_md5(ntlm_v2_key, nt_proof_vec);
+
+    const std::vector<std::uint8_t> domain_utf16{};
+    const std::vector<std::uint8_t> user_utf16 = to_utf16le_ascii(canonical_user, false);
+    const std::vector<std::uint8_t> workstation_utf16{};
+    const std::vector<std::uint8_t> lm_response{};
+    const std::vector<std::uint8_t> encrypted_session_key{};
+
+    const std::size_t base = 64U;
+    const std::size_t lm_off = base;
+    const std::size_t nt_off = lm_off + lm_response.size();
+    const std::size_t domain_off = nt_off + nt_response.size();
+    const std::size_t user_off = domain_off + domain_utf16.size();
+    const std::size_t workstation_off = user_off + user_utf16.size();
+    const std::size_t key_off = workstation_off + workstation_utf16.size();
+    const std::size_t total = key_off + encrypted_session_key.size();
+    if (total > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+        return false;
+    }
+    out_blob.assign(total, 0U);
+    std::memcpy(out_blob.data(), "NTLMSSP\0", 8U);
+    const std::uint32_t type_le = to_le32(3U);
+    std::memcpy(out_blob.data() + 8U, &type_le, sizeof(type_le));
+    const auto write_secbuf = [&](std::size_t off, std::size_t len, std::size_t ptr_off) {
+        SMB_EXPECT(len <= static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()));
+        SMB_EXPECT(ptr_off <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()));
+        const std::uint16_t len16 = to_le16(static_cast<std::uint16_t>(len));
+        const std::uint32_t off32 = to_le32(static_cast<std::uint32_t>(ptr_off));
+        std::memcpy(out_blob.data() + off + 0U, &len16, sizeof(len16));
+        std::memcpy(out_blob.data() + off + 2U, &len16, sizeof(len16));
+        std::memcpy(out_blob.data() + off + 4U, &off32, sizeof(off32));
+    };
+    write_secbuf(12U, lm_response.size(), lm_off);
+    write_secbuf(20U, nt_response.size(), nt_off);
+    write_secbuf(28U, domain_utf16.size(), domain_off);
+    write_secbuf(36U, user_utf16.size(), user_off);
+    write_secbuf(44U, workstation_utf16.size(), workstation_off);
+    write_secbuf(52U, encrypted_session_key.size(), key_off);
+    const std::uint32_t flags_le = to_le32(0x00088201U);
+    std::memcpy(out_blob.data() + 60U, &flags_le, sizeof(flags_le));
+    std::memcpy(out_blob.data() + nt_off, nt_response.data(), nt_response.size());
+    std::memcpy(out_blob.data() + user_off, user_utf16.data(), user_utf16.size());
+    return true;
 }
 
 void push_utf16le_ascii(std::vector<std::uint8_t>& out, const std::string& text) {
@@ -6260,6 +6600,126 @@ bool extract_read_data(const std::vector<std::uint8_t>& payload, std::vector<std
     return true;
 }
 
+bool build_ntlm_type3_blob_with_nt_response(const std::string& username,
+                                            const std::vector<std::uint8_t>& nt_response,
+                                            std::vector<std::uint8_t>& out_blob) {
+    out_blob.clear();
+    if (username.empty() || nt_response.empty()) {
+        return false;
+    }
+    const std::vector<std::uint8_t> domain_utf16{};
+    const std::vector<std::uint8_t> user_utf16 = to_utf16le_ascii(strip_qualified_username(username), false);
+    const std::vector<std::uint8_t> workstation_utf16{};
+    const std::vector<std::uint8_t> lm_response{};
+    const std::vector<std::uint8_t> encrypted_session_key{};
+
+    const std::size_t base = 64U;
+    const std::size_t lm_off = base;
+    const std::size_t nt_off = lm_off + lm_response.size();
+    const std::size_t domain_off = nt_off + nt_response.size();
+    const std::size_t user_off = domain_off + domain_utf16.size();
+    const std::size_t workstation_off = user_off + user_utf16.size();
+    const std::size_t key_off = workstation_off + workstation_utf16.size();
+    const std::size_t total = key_off + encrypted_session_key.size();
+    if (total > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+        return false;
+    }
+    out_blob.assign(total, 0U);
+    std::memcpy(out_blob.data(), "NTLMSSP\0", 8U);
+    const std::uint32_t type_le = to_le32(3U);
+    std::memcpy(out_blob.data() + 8U, &type_le, sizeof(type_le));
+    const auto write_secbuf = [&](std::size_t off, std::size_t len, std::size_t ptr_off) {
+        SMB_EXPECT(len <= static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()));
+        SMB_EXPECT(ptr_off <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()));
+        const std::uint16_t len16 = to_le16(static_cast<std::uint16_t>(len));
+        const std::uint32_t off32 = to_le32(static_cast<std::uint32_t>(ptr_off));
+        std::memcpy(out_blob.data() + off + 0U, &len16, sizeof(len16));
+        std::memcpy(out_blob.data() + off + 2U, &len16, sizeof(len16));
+        std::memcpy(out_blob.data() + off + 4U, &off32, sizeof(off32));
+    };
+    write_secbuf(12U, lm_response.size(), lm_off);
+    write_secbuf(20U, nt_response.size(), nt_off);
+    write_secbuf(28U, domain_utf16.size(), domain_off);
+    write_secbuf(36U, user_utf16.size(), user_off);
+    write_secbuf(44U, workstation_utf16.size(), workstation_off);
+    write_secbuf(52U, encrypted_session_key.size(), key_off);
+    const std::uint32_t flags_le = to_le32(0x00088201U);
+    std::memcpy(out_blob.data() + 60U, &flags_le, sizeof(flags_le));
+    std::memcpy(out_blob.data() + nt_off, nt_response.data(), nt_response.size());
+    std::memcpy(out_blob.data() + user_off, user_utf16.data(), user_utf16.size());
+    return true;
+}
+
+bool build_ntlmv1_type3_security_blob_for_test(const std::string& username,
+                                                const std::string& password,
+                                                const std::array<std::uint8_t, 8>& challenge,
+                                                std::vector<std::uint8_t>& out_blob) {
+    const std::vector<std::uint8_t> pass_utf16 = to_utf16le_ascii(password, false);
+    const std::array<std::uint8_t, 16> nt_hash = md4_hash(pass_utf16);
+    const std::array<std::uint8_t, 24> nt_resp = ntlm_desl_encrypt(nt_hash, challenge);
+    const std::vector<std::uint8_t> nt_response(nt_resp.begin(), nt_resp.end());
+    return build_ntlm_type3_blob_with_nt_response(username, nt_response, out_blob);
+}
+
+bool run_ntlmv2_session_setup_for_test(ConnectionState& state,
+                                       const AuthConfig& auth,
+                                       const std::string& share_dir_text,
+                                       const ShareSecurityConfig& hardening,
+                                       const std::array<std::uint8_t, 16>& guid,
+                                       std::uint64_t start_time,
+                                       std::uint64_t type1_message_id,
+                                       std::uint64_t type3_message_id,
+                                       const std::string& username,
+                                       const std::string& password,
+                                       std::uint64_t& out_session_id,
+                                       std::array<std::uint8_t, 16>& out_signing_key) {
+    out_session_id = 0U;
+    out_signing_key.fill(0U);
+    const std::vector<std::uint8_t> type1_blob = make_ntlm_type1_security_blob();
+    const std::vector<std::uint8_t> type1_req =
+        make_session_setup_request_payload_with_blob(type1_message_id, 0U, type1_blob);
+    RequestResult type1_rsp = process_request(type1_req, state, auth, share_dir_text, hardening, guid, start_time);
+    if (type1_rsp.payload.empty() ||
+        !validate_response_header(type1_rsp.payload,
+                                  static_cast<std::uint16_t>(Smb2Command::SessionSetup),
+                                  type1_message_id,
+                                  kStatusMoreProcessingRequired)) {
+        return false;
+    }
+    const std::uint64_t intermediate_session_id = read_le64(type1_rsp.payload.data() + 40U);
+    if (intermediate_session_id == 0U) {
+        return false;
+    }
+
+    const std::uint8_t* challenge_blob = nullptr;
+    std::size_t challenge_blob_size = 0U;
+    if (!extract_session_setup_response_security_blob(type1_rsp.payload, challenge_blob, challenge_blob_size) ||
+        (challenge_blob == nullptr) || (challenge_blob_size == 0U)) {
+        return false;
+    }
+    std::array<std::uint8_t, 8> server_challenge{};
+    if (!extract_ntlm_type2_challenge(challenge_blob, challenge_blob_size, server_challenge)) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> type3_blob{};
+    if (!build_ntlmv2_type3_security_blob(username, password, server_challenge, type3_blob, out_signing_key)) {
+        return false;
+    }
+    const std::vector<std::uint8_t> type3_req =
+        make_session_setup_request_payload_with_blob(type3_message_id, intermediate_session_id, type3_blob);
+    RequestResult type3_rsp = process_request(type3_req, state, auth, share_dir_text, hardening, guid, start_time);
+    if (type3_rsp.payload.empty() ||
+        !validate_response_header(type3_rsp.payload,
+                                  static_cast<std::uint16_t>(Smb2Command::SessionSetup),
+                                  type3_message_id,
+                                  kStatusSuccess)) {
+        return false;
+    }
+    out_session_id = read_le64(type3_rsp.payload.data() + 40U);
+    return out_session_id != 0U;
+}
+
 int run_packet_self_test(bool verbose) {
     if (!des_known_vector_ok()) {
         std::cerr << "[self-test] DES primitive failed known test vector" << std::endl;
@@ -6284,9 +6744,14 @@ int run_packet_self_test(bool verbose) {
     }
 
     ConnectionState state{};
-    const std::array<std::uint8_t, 16> guid = create_server_guid();
+    const auto guid_opt = create_server_guid();
+    if (!guid_opt.has_value()) {
+        std::cerr << "[self-test] failed to generate secure server guid" << std::endl;
+        return static_cast<int>(ExitCode::GenericError);
+    }
+    const std::array<std::uint8_t, 16> guid = guid_opt.value();
     const std::uint64_t start_time = now_windows_filetime_utc();
-    const AuthConfig auth{true, true, true, false, false, "testuser", "testpass"};
+    const AuthConfig auth{true, false, false, false, false, "testuser", "testpass"};
     ShareSecurityConfig hardening{};
     const std::filesystem::path share_dir =
         (std::filesystem::temp_directory_path() / "smb_single_self_test_share").lexically_normal();
@@ -6310,21 +6775,14 @@ int run_packet_self_test(bool verbose) {
         return static_cast<int>(ExitCode::GenericError);
     }
 
-    const std::vector<std::uint8_t> setup_req = make_session_setup_request_payload(2U, "testuser", "testpass", true);
-    RequestResult r2 = process_request(setup_req, state, auth, share_dir_text, hardening, guid, start_time);
-    if (r2.payload.empty()) {
-        std::cerr << "[self-test] SESSION_SETUP returned empty payload" << std::endl;
+    std::array<std::uint8_t, 16> main_session_key{};
+    std::uint64_t session_id = 0U;
+    if (!run_ntlmv2_session_setup_for_test(
+            state, auth, share_dir_text, hardening, guid, start_time, 200U, 2U, "testuser", "testpass", session_id, main_session_key)) {
+        std::cerr << "[self-test] NTLMv2 SESSION_SETUP sequence failed" << std::endl;
         return static_cast<int>(ExitCode::GenericError);
     }
-    if (!validate_response_header(r2.payload, static_cast<std::uint16_t>(Smb2Command::SessionSetup), 2U, kStatusSuccess)) {
-        std::cerr << "[self-test] SESSION_SETUP response header invalid" << std::endl;
-        return static_cast<int>(ExitCode::GenericError);
-    }
-    if (read_le64(r2.payload.data() + 40U) == 0U) {
-        std::cerr << "[self-test] SESSION_SETUP returned zero session id" << std::endl;
-        return static_cast<int>(ExitCode::GenericError);
-    }
-    const std::uint64_t session_id = read_le64(r2.payload.data() + 40U);
+    (void)main_session_key;
 
     const std::vector<std::uint8_t> tree_req =
         make_tree_connect_request_payload(3U, session_id, "//127.0.0.1/share");
@@ -6607,12 +7065,8 @@ int run_packet_self_test(bool verbose) {
         return static_cast<int>(ExitCode::GenericError);
     }
 
-    const AuthConfig signing_auth{true, true, true, true, true, "testuser", "testpass"};
+    const AuthConfig signing_auth{true, false, false, true, true, "testuser", "testpass"};
     std::array<std::uint8_t, 16> signing_key{};
-    if (!derive_userpass_signing_key(signing_auth.username, signing_auth.password, signing_key)) {
-        std::cerr << "[self-test] failed to derive signing key" << std::endl;
-        return static_cast<int>(ExitCode::GenericError);
-    }
 
     ConnectionState signing_state{};
     const std::vector<std::uint8_t> signing_neg_req = make_negotiate_request_payload(30U);
@@ -6637,22 +7091,20 @@ int run_packet_self_test(bool verbose) {
         return static_cast<int>(ExitCode::GenericError);
     }
 
-    const std::vector<std::uint8_t> signing_setup_req =
-        make_session_setup_request_payload(31U, "testuser", "testpass", true);
-    RequestResult signing_setup_rsp =
-        process_request(signing_setup_req, signing_state, signing_auth, share_dir_text, hardening, guid, start_time);
-    if (signing_setup_rsp.payload.empty()) {
-        std::cerr << "[self-test] SESSION_SETUP(signing) returned empty payload" << std::endl;
-        return static_cast<int>(ExitCode::GenericError);
-    }
-    if (!validate_response_header(
-            signing_setup_rsp.payload, static_cast<std::uint16_t>(Smb2Command::SessionSetup), 31U, kStatusSuccess)) {
-        std::cerr << "[self-test] SESSION_SETUP(signing) response invalid" << std::endl;
-        return static_cast<int>(ExitCode::GenericError);
-    }
-    const std::uint64_t signing_session_id = read_le64(signing_setup_rsp.payload.data() + 40U);
-    if (signing_session_id == 0U) {
-        std::cerr << "[self-test] SESSION_SETUP(signing) session id invalid" << std::endl;
+    std::uint64_t signing_session_id = 0U;
+    if (!run_ntlmv2_session_setup_for_test(signing_state,
+                                           signing_auth,
+                                           share_dir_text,
+                                           hardening,
+                                           guid,
+                                           start_time,
+                                           131U,
+                                           31U,
+                                           "testuser",
+                                           "testpass",
+                                           signing_session_id,
+                                           signing_key)) {
+        std::cerr << "[self-test] SESSION_SETUP(signing) NTLMv2 sequence failed" << std::endl;
         return static_cast<int>(ExitCode::GenericError);
     }
 
@@ -6679,17 +7131,20 @@ int run_packet_self_test(bool verbose) {
         std::cerr << "[self-test] NEGOTIATE(signing-ok path) returned empty payload" << std::endl;
         return static_cast<int>(ExitCode::GenericError);
     }
-    const std::vector<std::uint8_t> signing_setup_ok_req =
-        make_session_setup_request_payload(41U, "testuser", "testpass", true);
-    RequestResult signing_setup_ok_rsp =
-        process_request(signing_setup_ok_req, signing_state_ok, signing_auth, share_dir_text, hardening, guid, start_time);
-    if (signing_setup_ok_rsp.payload.empty()) {
-        std::cerr << "[self-test] SESSION_SETUP(signing-ok path) returned empty payload" << std::endl;
-        return static_cast<int>(ExitCode::GenericError);
-    }
-    const std::uint64_t signing_ok_session_id = read_le64(signing_setup_ok_rsp.payload.data() + 40U);
-    if (signing_ok_session_id == 0U) {
-        std::cerr << "[self-test] SESSION_SETUP(signing-ok path) invalid session id" << std::endl;
+    std::uint64_t signing_ok_session_id = 0U;
+    if (!run_ntlmv2_session_setup_for_test(signing_state_ok,
+                                           signing_auth,
+                                           share_dir_text,
+                                           hardening,
+                                           guid,
+                                           start_time,
+                                           141U,
+                                           41U,
+                                           "testuser",
+                                           "testpass",
+                                           signing_ok_session_id,
+                                           signing_key)) {
+        std::cerr << "[self-test] SESSION_SETUP(signing-ok path) NTLMv2 sequence failed" << std::endl;
         return static_cast<int>(ExitCode::GenericError);
     }
 
@@ -6716,6 +7171,18 @@ int run_packet_self_test(bool verbose) {
     }
     if (!smb2_verify_packet_signature(signed_tree_rsp.payload, signing_key)) {
         std::cerr << "[self-test] TREE_CONNECT(signed) response signature invalid" << std::endl;
+        return static_cast<int>(ExitCode::GenericError);
+    }
+
+    RequestResult replay_tree_rsp =
+        process_request(signed_tree_req, signing_state_ok, signing_auth, share_dir_text, hardening, guid, start_time);
+    if (replay_tree_rsp.payload.empty()) {
+        std::cerr << "[self-test] TREE_CONNECT(replay) returned empty payload" << std::endl;
+        return static_cast<int>(ExitCode::GenericError);
+    }
+    if (!validate_response_header(
+            replay_tree_rsp.payload, static_cast<std::uint16_t>(Smb2Command::TreeConnect), 42U, kStatusAccessDenied)) {
+        std::cerr << "[self-test] TREE_CONNECT(replay) expected ACCESS_DENIED" << std::endl;
         return static_cast<int>(ExitCode::GenericError);
     }
 
@@ -6752,16 +7219,79 @@ int run_packet_self_test(bool verbose) {
         return static_cast<int>(ExitCode::GenericError);
     }
     const std::vector<std::uint8_t> bad_setup_req =
-        make_session_setup_request_payload(21U, "testuser", "wrongpass", true);
+        make_session_setup_request_payload(21U, "testuser", "testpass", true);
     RequestResult bad_setup =
         process_request(bad_setup_req, auth_fail_state, auth, share_dir_text, hardening, guid, start_time);
     if (bad_setup.payload.empty()) {
-        std::cerr << "[self-test] bad SESSION_SETUP returned empty payload" << std::endl;
+        std::cerr << "[self-test] USER/PASS SESSION_SETUP returned empty payload" << std::endl;
         return static_cast<int>(ExitCode::GenericError);
     }
     if (!validate_response_header(
             bad_setup.payload, static_cast<std::uint16_t>(Smb2Command::SessionSetup), 21U, kStatusLogonFailure)) {
-        std::cerr << "[self-test] bad SESSION_SETUP expected LOGON_FAILURE" << std::endl;
+        std::cerr << "[self-test] USER/PASS SESSION_SETUP expected LOGON_FAILURE" << std::endl;
+        return static_cast<int>(ExitCode::GenericError);
+    }
+
+    ConnectionState legacy_fail_state{};
+    RequestResult legacy_neg =
+        process_request(negotiate_req, legacy_fail_state, auth, share_dir_text, hardening, guid, start_time);
+    if (legacy_neg.payload.empty()) {
+        std::cerr << "[self-test] NEGOTIATE(legacy-fail path) returned empty payload" << std::endl;
+        return static_cast<int>(ExitCode::GenericError);
+    }
+    const std::vector<std::uint8_t> legacy_type1_req =
+        make_session_setup_request_payload_with_blob(220U, 0U, make_ntlm_type1_security_blob());
+    RequestResult legacy_type1_rsp =
+        process_request(legacy_type1_req, legacy_fail_state, auth, share_dir_text, hardening, guid, start_time);
+    if (legacy_type1_rsp.payload.empty() ||
+        !validate_response_header(legacy_type1_rsp.payload,
+                                  static_cast<std::uint16_t>(Smb2Command::SessionSetup),
+                                  220U,
+                                  kStatusMoreProcessingRequired)) {
+        std::cerr << "[self-test] NTLM type1 setup for legacy path failed" << std::endl;
+        return static_cast<int>(ExitCode::GenericError);
+    }
+    const std::uint8_t* legacy_challenge_blob = nullptr;
+    std::size_t legacy_challenge_blob_size = 0U;
+    if (!extract_session_setup_response_security_blob(
+            legacy_type1_rsp.payload, legacy_challenge_blob, legacy_challenge_blob_size) ||
+        (legacy_challenge_blob == nullptr) || (legacy_challenge_blob_size == 0U)) {
+        std::cerr << "[self-test] NTLM legacy challenge extraction failed" << std::endl;
+        return static_cast<int>(ExitCode::GenericError);
+    }
+    std::array<std::uint8_t, 8> legacy_challenge{};
+    if (!extract_ntlm_type2_challenge(legacy_challenge_blob, legacy_challenge_blob_size, legacy_challenge)) {
+        std::cerr << "[self-test] NTLM legacy challenge parse failed" << std::endl;
+        return static_cast<int>(ExitCode::GenericError);
+    }
+    std::vector<std::uint8_t> legacy_type3_blob{};
+    if (!build_ntlmv1_type3_security_blob_for_test("testuser", "testpass", legacy_challenge, legacy_type3_blob)) {
+        std::cerr << "[self-test] failed to build NTLMv1 type3 blob" << std::endl;
+        return static_cast<int>(ExitCode::GenericError);
+    }
+    const std::uint64_t legacy_session_id = read_le64(legacy_type1_rsp.payload.data() + 40U);
+    const std::vector<std::uint8_t> legacy_type3_req =
+        make_session_setup_request_payload_with_blob(221U, legacy_session_id, legacy_type3_blob);
+    RequestResult legacy_type3_rsp =
+        process_request(legacy_type3_req, legacy_fail_state, auth, share_dir_text, hardening, guid, start_time);
+    if (legacy_type3_rsp.payload.empty() ||
+        !validate_response_header(legacy_type3_rsp.payload,
+                                  static_cast<std::uint16_t>(Smb2Command::SessionSetup),
+                                  221U,
+                                  kStatusLogonFailure)) {
+        std::cerr << "[self-test] NTLMv1/NTLM2-session fallback was not rejected" << std::endl;
+        return static_cast<int>(ExitCode::GenericError);
+    }
+
+    ConnectionState compound_state{};
+    std::vector<std::uint8_t> compound_neg_req = make_negotiate_request_payload(230U);
+    write_le32_at(compound_neg_req, 20U, 64U);
+    RequestResult compound_rsp =
+        process_request(compound_neg_req, compound_state, auth, share_dir_text, hardening, guid, start_time);
+    if (compound_rsp.payload.empty() ||
+        !validate_response_header(
+            compound_rsp.payload, static_cast<std::uint16_t>(Smb2Command::Negotiate), 230U, kStatusInvalidParameter)) {
+        std::cerr << "[self-test] compound request should be rejected" << std::endl;
         return static_cast<int>(ExitCode::GenericError);
     }
 
@@ -6845,35 +7375,107 @@ int run_smoke_client(const std::string& host,
         return static_cast<int>(ExitCode::GenericError);
     }
 
-    const std::vector<std::uint8_t> setup_wire =
-        add_nbss_header(make_session_setup_request_payload(2U, username, password, !allow_anonymous));
-    if (!send_all(sock, setup_wire.data(), setup_wire.size())) {
-        std::cerr << "[smoke] failed to send SESSION_SETUP" << std::endl;
-        close_socket(sock);
-        return static_cast<int>(ExitCode::GenericError);
-    }
-    std::vector<std::uint8_t> setup_response{};
-    if (!recv_nbss_payload(sock, setup_response)) {
-        std::cerr << "[smoke] failed to read SESSION_SETUP response" << std::endl;
-        close_socket(sock);
-        return static_cast<int>(ExitCode::GenericError);
-    }
-    if (!validate_response_header(
-            setup_response, static_cast<std::uint16_t>(Smb2Command::SessionSetup), 2U, kStatusSuccess)) {
-        std::cerr << "[smoke] SESSION_SETUP response invalid" << std::endl;
-        close_socket(sock);
-        return static_cast<int>(ExitCode::GenericError);
-    }
-    if (read_le64(setup_response.data() + 40U) == 0U) {
-        std::cerr << "[smoke] SESSION_SETUP session id invalid" << std::endl;
-        close_socket(sock);
-        return static_cast<int>(ExitCode::GenericError);
-    }
-    const std::uint64_t session_id = read_le64(setup_response.data() + 40U);
     std::array<std::uint8_t, 16> signing_key{};
     bool signing_active = false;
-    if (!disable_client_signing && !allow_anonymous && !username.empty() && !password.empty()) {
-        signing_active = derive_userpass_signing_key(username, password, signing_key);
+    std::uint64_t session_id = 0U;
+    if (allow_anonymous) {
+        const std::vector<std::uint8_t> anon_setup_wire =
+            add_nbss_header(make_session_setup_request_payload_with_blob(2U, 0U, std::vector<std::uint8_t>{}));
+        if (!send_all(sock, anon_setup_wire.data(), anon_setup_wire.size())) {
+            std::cerr << "[smoke] failed to send SESSION_SETUP(anonymous)" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        std::vector<std::uint8_t> anon_setup_response{};
+        if (!recv_nbss_payload(sock, anon_setup_response)) {
+            std::cerr << "[smoke] failed to read SESSION_SETUP(anonymous) response" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        if (!validate_response_header(
+                anon_setup_response, static_cast<std::uint16_t>(Smb2Command::SessionSetup), 2U, kStatusSuccess)) {
+            std::cerr << "[smoke] SESSION_SETUP(anonymous) response invalid" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        session_id = read_le64(anon_setup_response.data() + 40U);
+        if (session_id == 0U) {
+            std::cerr << "[smoke] SESSION_SETUP(anonymous) session id invalid" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+    } else {
+        const std::vector<std::uint8_t> type1_wire =
+            add_nbss_header(make_session_setup_request_payload_with_blob(2U, 0U, make_ntlm_type1_security_blob()));
+        if (!send_all(sock, type1_wire.data(), type1_wire.size())) {
+            std::cerr << "[smoke] failed to send SESSION_SETUP(type1)" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        std::vector<std::uint8_t> type1_response{};
+        if (!recv_nbss_payload(sock, type1_response)) {
+            std::cerr << "[smoke] failed to read SESSION_SETUP(type1) response" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        if (!validate_response_header(
+                type1_response, static_cast<std::uint16_t>(Smb2Command::SessionSetup), 2U, kStatusMoreProcessingRequired)) {
+            std::cerr << "[smoke] SESSION_SETUP(type1) response invalid" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        const std::uint64_t intermediate_session_id = read_le64(type1_response.data() + 40U);
+        if (intermediate_session_id == 0U) {
+            std::cerr << "[smoke] SESSION_SETUP(type1) intermediate session id invalid" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        const std::uint8_t* challenge_blob = nullptr;
+        std::size_t challenge_blob_size = 0U;
+        if (!extract_session_setup_response_security_blob(type1_response, challenge_blob, challenge_blob_size) ||
+            (challenge_blob == nullptr) || (challenge_blob_size == 0U)) {
+            std::cerr << "[smoke] SESSION_SETUP(type1) challenge blob missing" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        std::array<std::uint8_t, 8> server_challenge{};
+        if (!extract_ntlm_type2_challenge(challenge_blob, challenge_blob_size, server_challenge)) {
+            std::cerr << "[smoke] failed to parse NTLM type2 challenge" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        std::vector<std::uint8_t> type3_blob{};
+        if (!build_ntlmv2_type3_security_blob(username, password, server_challenge, type3_blob, signing_key)) {
+            std::cerr << "[smoke] failed to build NTLMv2 type3 blob" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        const std::vector<std::uint8_t> type3_wire = add_nbss_header(
+            make_session_setup_request_payload_with_blob(3U, intermediate_session_id, type3_blob));
+        if (!send_all(sock, type3_wire.data(), type3_wire.size())) {
+            std::cerr << "[smoke] failed to send SESSION_SETUP(type3)" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        std::vector<std::uint8_t> type3_response{};
+        if (!recv_nbss_payload(sock, type3_response)) {
+            std::cerr << "[smoke] failed to read SESSION_SETUP(type3) response" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        if (!validate_response_header(
+                type3_response, static_cast<std::uint16_t>(Smb2Command::SessionSetup), 3U, kStatusSuccess)) {
+            std::cerr << "[smoke] SESSION_SETUP(type3) response invalid" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        session_id = read_le64(type3_response.data() + 40U);
+        if (session_id == 0U) {
+            std::cerr << "[smoke] SESSION_SETUP(type3) session id invalid" << std::endl;
+            close_socket(sock);
+            return static_cast<int>(ExitCode::GenericError);
+        }
+        signing_active = !disable_client_signing;
     }
     const auto make_wire = [&](std::vector<std::uint8_t> req) {
         if (signing_active) {
@@ -7048,7 +7650,11 @@ void print_usage() {
         << "  --port <n>          TCP port (default 445)\n"
         << "  --once              handle one connection and exit\n"
         << "  --max-clients <n>   concurrent clients limit (default 128)\n"
+        << "  --max-clients-per-ip <n> per-IP concurrent client limit (default 8)\n"
         << "  --timeout <n>       socket timeout seconds (default 10)\n"
+        << "  --auth-fail-window-sec <n> auth failure counting window in seconds (default 600)\n"
+        << "  --auth-fail-max <n> max auth failures in window before temporary block (default 5)\n"
+        << "  --auth-block-sec <n> temporary block duration in seconds after brute force (default 1800)\n"
         << "  --share-dir <path>  local directory exposed by the server (default .)\n"
         << "  --read-only         disable WRITE and destructive CREATE dispositions\n"
         << "  --allow-overwrite   permit overwrite dispositions (supersede/overwrite)\n"
@@ -7060,7 +7666,7 @@ void print_usage() {
         << "  --password <text>   required login password (serve/smoke-client)\n"
         << "  --allow-anonymous   disable auth requirement (serve/smoke-client)\n"
         << "  --strict-auth-session-flags  disable guest-compat session flag for authenticated logins\n"
-        << "  --disable-legacy-ntlm reject NTLMv1/NTLM2-session auth (allow only NTLMv2)\n"
+        << "  --disable-legacy-ntlm compatibility flag; legacy NTLM is always disabled\n"
         << "  --enable-signing    enable SMB2 packet signing for authenticated sessions\n"
         << "  --require-signing   require signed SMB2 requests after authentication\n"
         << "  --prod-profile      apply production defaults and stricter validations\n"
@@ -7270,6 +7876,10 @@ bool parse_cli(int argc, char** argv, CliOptions& out, std::string& error) {
             out.allow_anonymous = false;
             out.server.timeout_seconds = 30;
             out.server.max_clients = 256U;
+            out.server.abuse.max_clients_per_ip = kDefaultProductionMaxClientsPerIp;
+            out.server.abuse.auth_fail_window_sec = 900U;
+            out.server.abuse.auth_fail_max = 3U;
+            out.server.abuse.auth_block_sec = 3600U;
             out.server.min_password_length = kMinProductionPasswordLength;
             out.server.auth.signing_enabled = true;
             out.server.hardening.allow_overwrite = false;
@@ -7293,6 +7903,20 @@ bool parse_cli(int argc, char** argv, CliOptions& out, std::string& error) {
             continue;
         }
 
+        if (arg == "--max-clients-per-ip") {
+            if ((argi + 1) >= argc) {
+                error = "--max-clients-per-ip requires a value";
+                return false;
+            }
+            std::uint32_t max_clients_per_ip = 0U;
+            if (!parse_u32(argv[++argi], &max_clients_per_ip) || (max_clients_per_ip == 0U)) {
+                error = "invalid --max-clients-per-ip value";
+                return false;
+            }
+            out.server.abuse.max_clients_per_ip = static_cast<std::size_t>(max_clients_per_ip);
+            continue;
+        }
+
         if (arg == "--timeout") {
             if ((argi + 1) >= argc) {
                 error = "--timeout requires a value";
@@ -7304,6 +7928,48 @@ bool parse_cli(int argc, char** argv, CliOptions& out, std::string& error) {
                 return false;
             }
             out.server.timeout_seconds = timeout_seconds;
+            continue;
+        }
+
+        if (arg == "--auth-fail-window-sec") {
+            if ((argi + 1) >= argc) {
+                error = "--auth-fail-window-sec requires a value";
+                return false;
+            }
+            std::uint32_t window_sec = 0U;
+            if (!parse_u32(argv[++argi], &window_sec) || (window_sec == 0U)) {
+                error = "invalid --auth-fail-window-sec value";
+                return false;
+            }
+            out.server.abuse.auth_fail_window_sec = window_sec;
+            continue;
+        }
+
+        if (arg == "--auth-fail-max") {
+            if ((argi + 1) >= argc) {
+                error = "--auth-fail-max requires a value";
+                return false;
+            }
+            std::uint32_t fail_max = 0U;
+            if (!parse_u32(argv[++argi], &fail_max) || (fail_max == 0U)) {
+                error = "invalid --auth-fail-max value";
+                return false;
+            }
+            out.server.abuse.auth_fail_max = static_cast<std::size_t>(fail_max);
+            continue;
+        }
+
+        if (arg == "--auth-block-sec") {
+            if ((argi + 1) >= argc) {
+                error = "--auth-block-sec requires a value";
+                return false;
+            }
+            std::uint32_t block_sec = 0U;
+            if (!parse_u32(argv[++argi], &block_sec) || (block_sec == 0U)) {
+                error = "invalid --auth-block-sec value";
+                return false;
+            }
+            out.server.abuse.auth_block_sec = block_sec;
             continue;
         }
 
@@ -7335,6 +8001,7 @@ int run_cli(const CliOptions& cli) {
         cfg.auth.require_auth = !cli.allow_anonymous;
         cfg.auth.username = cli.username;
         cfg.auth.password = cli.password;
+        cfg.auth.allow_legacy_ntlm = false;
         rc = run_server(cfg);
     } else if (cli.mode == CliMode::SmokeClient) {
         rc = run_smoke_client(

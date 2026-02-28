@@ -1,0 +1,33 @@
+#!/usr/sbin/nft -f
+
+# Example nftables policy for smb-single.
+# Adjust interfaces/CIDRs before production use.
+
+define SMB_PORT = 445
+define TRUSTED_V4 = { 10.0.0.0/8, 192.168.0.0/16 }
+define TRUSTED_V6 = { fd00::/8 }
+
+table inet smb_single {
+  chain input {
+    type filter hook input priority 0;
+
+    # Keep established traffic flowing.
+    ct state established,related accept
+
+    # Allow loopback.
+    iifname "lo" accept
+
+    # SMB only from trusted ranges.
+    tcp dport $SMB_PORT ip saddr != $TRUSTED_V4 drop
+    tcp dport $SMB_PORT ip6 saddr != $TRUSTED_V6 drop
+
+    # Burst/rate control against TCP floods.
+    tcp dport $SMB_PORT ct state new limit rate over 30/second burst 60 packets drop
+
+    # Per-source connection cap at firewall level.
+    tcp dport $SMB_PORT ct state new meter smb_conn_by_src { ip saddr limit rate 10/minute } accept
+
+    # Allow service port after checks.
+    tcp dport $SMB_PORT accept
+  }
+}

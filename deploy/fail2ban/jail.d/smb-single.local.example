@@ -1,0 +1,10 @@
+[smb-single]
+enabled = true
+filter = smb-single
+port = 445
+logpath = /var/log/smb-single.log
+backend = auto
+maxretry = 5
+findtime = 10m
+bantime = 30m
+banaction = nftables-multiport
